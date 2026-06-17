@@ -26,7 +26,7 @@ Cropkeep uses two styles that each serve a different purpose and scale. They sha
 | Style | Used for | Key quality |
 |---|---|---|
 | **Sticker illustration** | Crop icons, well icons, reward assets, decorations | Physical, collectible, warm — like a die-cut sticker |
-| **Kawaii flat icon** | Navigation icons, weather icons, status badges, UI chrome | Simple, round, immediately readable at small sizes |
+| **Kawaii flat icon** | Navigation icons, status badges, UI chrome | Simple, round, immediately readable at small sizes |
 
 ---
 
@@ -172,19 +172,6 @@ Appear during harvests, in the Market, and as reward moments. Same sticker style
 
 ---
 
-### Weather condition assets — Kawaii flat icon style
-
-Shown in the weather banner at the top of the Farm screen. Must read clearly at 48px display size. Use kawaii flat style — maximum simplicity.
-
-| Weather | Object | Color note | Prompt |
-|---|---|---|---|
-| ☀️ Sunny | Round sun, 8 short stubby rays | Warm yellow `#F0C830`, pale yellow rays | `cute sun, round face, short stubby rays, kawaii flat icon` |
-| 🌧️ Rainy | Puffy cloud, 3 round raindrops below | Blue-grey cloud `#A0B8C8`, blue drops `#70A0C8` | `cute rain cloud, three round drops below, kawaii flat icon` |
-| 🌕 Harvest moon | Full round moon, soft halo ring around it | Warm ivory `#F5EED0`, pale gold halo | `full moon, soft halo ring, kawaii flat icon, warm ivory` |
-| 🌪️ Storm | Dark puffy cloud, small chunky lightning bolt | Charcoal cloud `#707888`, yellow bolt `#F0C830` | `storm cloud, small lightning bolt, kawaii flat icon` |
-
----
-
 ### Navigation icons — Kawaii flat icon style
 
 Four icons for the bottom navigation bar. Must work at 24px display size. Active state: `#5BAF3A`. Inactive state: `#888888`.
@@ -318,7 +305,6 @@ Export all AI-generated assets at 3× intended display size. PNG with transparen
 | Crop icon — plot tile | 72×72px | 216×216px |
 | Crop icon — detail view | 120×120px | 360×360px |
 | Well icon | 56×56px | 168×168px |
-| Weather banner icon | 44×44px | 132×132px |
 | Reward / coin asset | 36×36px | 108×108px |
 | Navigation icon | 24×24px | 72×72px |
 | Market item | 88×88px | 264×264px |

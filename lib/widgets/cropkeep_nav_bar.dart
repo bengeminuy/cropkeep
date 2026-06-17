@@ -129,13 +129,15 @@ class _NavIsland extends StatelessWidget {
                   duration: const Duration(milliseconds: 350),
                   curve: Curves.easeOutCubic,
                   left: slotLeft + indicatorMargin,
-                  top: 0,
-                  bottom: 0,
+                  top: indicatorMargin,
+                  bottom: indicatorMargin,
                   width: tabSlot - 2 * indicatorMargin,
                   child: DecoratedBox(
                     decoration: BoxDecoration(
                       color: CropkeepColors.greenHint,
-                      borderRadius: BorderRadius.circular(20),
+                      // Concentric with the island: 28 (outer) − 6 (padding)
+                      // − 4 (indicatorMargin) = 18.
+                      borderRadius: BorderRadius.circular(18),
                     ),
                   ),
                 ),
@@ -207,7 +209,7 @@ class _NavItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     // Matches the sliding indicator's radius so the ripple shape echoes it.
-    final BorderRadius radius = BorderRadius.circular(20);
+    final BorderRadius radius = BorderRadius.circular(18);
     return Material(
       color: Colors.transparent,
       borderRadius: radius,

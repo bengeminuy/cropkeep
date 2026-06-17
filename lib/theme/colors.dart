@@ -15,6 +15,11 @@ class CropkeepColors {
   static const Color bgPlotReady = Color(0xFFD6F0C2);
   static const Color bgPageAlt = Color(0xFFE8EEF4);
   static const Color bgGoldWash = Color(0xFFFEF3D0);
+  // Sand wash sitting between bgScreen and bgNav — reserved for hero
+  // surfaces (page-defining numbers) so they read distinct from the
+  // white data cards beneath them. Tuned deeper than first pass so the
+  // surface jumps out from bgScreen without drifting into bgNav territory.
+  static const Color bgHero = Color(0xFFECDFC0);
 
   // Navigation bar (floating island)
   static const Color bgPillActive = Color(0xFFFAF6EE);
@@ -42,6 +47,15 @@ class CropkeepColors {
   static const Color textGreen = Color(0xFF5BAF3A);
   static const Color textGold = Color(0xFFF0A020);
   static const Color textRed = Color(0xFFE53030);
+  // Deep siblings used when text sits on a same-hue tinted background — the
+  // bright primaries fail WCAG AA on washes (≈2.5–3.8:1), these clear ≥5:1.
+  static const Color textGreenDeep = Color(0xFF2F7A22);
+  static const Color textGoldDeep = Color(0xFFA26800);
+  static const Color textRedDeep = Color(0xFFB21F1F);
+  // Secondary text on the warm sand bgHero. textSecondary (#888888) lands
+  // at ~3.4:1 on sand and fails AA — this warm brown sibling clears 6:1
+  // while staying in the same palette family as bgNav text.
+  static const Color textSecondaryOnHero = Color(0xFF6B5530);
   static const Color textOnGreenBtn = Color(0xFFFFFFFF);
   static const Color textOnGoldPill = Color(0xFF7A5000);
 
@@ -53,4 +67,13 @@ class CropkeepColors {
   static const Color borderGoldPill = Color(0xFFF0A020);
   static const Color borderBluePill = Color(0xFF5AACDC);
   static const Color borderDivider = Color(0xFFEEEBE4);
+
+  // Elevation
+  static const Color shadowCard = Color(0x0F000000);
+
+  // Hero-context progress track. greenHint / redAlert@18% (the data-card
+  // tracks) sit on white and clash against bgHero — this sand-shadow tone
+  // is a third-of-a-step darker than bgHero so the bar reads as a carved
+  // groove that accepts both green-deep and red-deep fills harmoniously.
+  static const Color progressTrackOnHero = Color(0xFFD8CAA8);
 }

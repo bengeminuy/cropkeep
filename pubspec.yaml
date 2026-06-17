@@ -38,6 +38,11 @@ dependencies:
   flutter_svg: ^2.0.0
   google_fonts: ^6.0.0
 
+  drift: ^2.20.0
+  drift_flutter: ^0.2.0
+  sqlite3_flutter_libs: ^0.5.0
+  path_provider: ^2.1.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -48,6 +53,30 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+
+  drift_dev: ^2.20.0
+  build_runner: ^2.4.0
+
+  flutter_launcher_icons: ^0.14.1
+
+flutter_launcher_icons:
+  image_path: "assets/branding/logo.png"
+  android: "ic_launcher"
+  adaptive_icon_background: "#FAF6EE"
+  adaptive_icon_foreground: "assets/branding/logo_foreground.png"
+  ios: true
+  remove_alpha_ios: true
+  background_color_ios: "#FAF6EE"
+  web:
+    generate: true
+    image_path: "assets/branding/logo.png"
+    background_color: "#FAF6EE"
+    theme_color: "#FAF6EE"
+  windows:
+    generate: true
+    image_path: "assets/branding/logo.png"
+    icon_size: 256
+  min_sdk_android: 21
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -62,6 +91,10 @@ flutter:
 
   assets:
     - assets/icons/
+    - assets/icons/flags/
+    - assets/icons/crops/
+    - assets/icons/fertilizers/
+    - assets/branding/
 
   # To add assets to your application, add an assets section, like this:
   # assets:
