@@ -1,5 +1,6 @@
 import 'package:drift/drift.dart';
 
+import '../../screens/market/market_catalog.dart';
 import '../currency_catalog.dart';
 import '../database.dart';
 import '../tables/cycles.dart';
@@ -78,10 +79,14 @@ class AppSettingsRepository {
     required String baseCode,
     required Set<String> secondaryCodes,
   }) async {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final monthLater = DateTime.fromMillisecondsSinceEpoch(now)
-        .add(const Duration(days: 30))
-        .millisecondsSinceEpoch;
+    final nowDt = DateTime.now();
+    final now = nowDt.millisecondsSinceEpoch;
+    // Cycles always span a single calendar month: 1st → last day. End-date
+    // uses day=0 of the *next* month (Dart treats it as the previous
+    // month's last day) so it remains valid for any month length.
+    final monthStart = DateTime(nowDt.year, nowDt.month, 1).millisecondsSinceEpoch;
+    final monthEnd =
+        DateTime(nowDt.year, nowDt.month + 1, 0).millisecondsSinceEpoch;
 
     await _db.transaction(() async {
       await _db.update(_db.currencies).write(
@@ -140,8 +145,8 @@ class AppSettingsRepository {
       if (activeCycle == null) {
         await _db.into(_db.cycles).insert(
               CyclesCompanion.insert(
-                startDate: now,
-                endDate: monthLater,
+                startDate: monthStart,
+                endDate: monthEnd,
                 state: CycleState.active,
                 createdAt: now,
               ),
@@ -262,6 +267,9 @@ class AppSettingsRepository {
           );
     }
 
+    await _resyncCurrencyCatalog();
+    await _resyncConsumableCrops();
+
     final existingSettings = await (_db.select(_db.appSettings)
           ..where((t) => t.id.equals(1)))
         .getSingleOrNull();
@@ -287,6 +295,83 @@ class AppSettingsRepository {
               lastUpdatedAt: DateTime.now().millisecondsSinceEpoch,
             ),
           );
+    }
+
+    await _healActiveCycleToMonth();
+  }
+
+  // Pre-rule onboarding created the active cycle as `now → now + 30d`. The
+  // rule is now: cycles always span a single calendar month. Heal any
+  // active cycle whose dates don't match by snapping to the month its
+  // original start date fell in. Cycle id, transactions, and incomes stay
+  // bound to the same row; only the date metadata moves.
+  Future<void> _healActiveCycleToMonth() async {
+    final active = await (_db.select(_db.cycles)
+          ..where((t) => t.state.equalsValue(CycleState.active)))
+        .getSingleOrNull();
+    if (active == null) return;
+    final start = DateTime.fromMillisecondsSinceEpoch(active.startDate);
+    final expectedStart = DateTime(start.year, start.month, 1);
+    final expectedEnd = DateTime(start.year, start.month + 1, 0);
+    if (active.startDate == expectedStart.millisecondsSinceEpoch &&
+        active.endDate == expectedEnd.millisecondsSinceEpoch) {
+      return;
+    }
+    await (_db.update(_db.cycles)..where((t) => t.id.equals(active.id))).write(
+      CyclesCompanion(
+        startDate: Value(expectedStart.millisecondsSinceEpoch),
+        endDate: Value(expectedEnd.millisecondsSinceEpoch),
+      ),
+    );
+  }
+
+  // Seeds the 15 consumable seed-pack crops driven by `MarketCatalog`.
+  // Idempotent via `insertOnConflictUpdate` keyed on `cropId`, so price
+  // / yield / pack-size rebalancing in MarketCatalog lands cleanly on
+  // existing installs without manual migration. Mirrors the
+  // `_resyncCurrencyCatalog` pattern. Tier-level economics (price,
+  // pack size, yield) come from `MarketCatalog.tierSpecs` so the DB
+  // row carries the canonical numbers per shop.md.
+  Future<void> _resyncConsumableCrops() async {
+    for (final spec in MarketCatalog.consumables) {
+      final tier = MarketCatalog.tierSpecs[spec.tier]!;
+      await _db.into(_db.cropsCatalog).insertOnConflictUpdate(
+            CropsCatalogCompanion.insert(
+              cropId: spec.cropId,
+              name: spec.name,
+              baseCoinYield: tier.yieldPerSeed,
+              isStarter: const Value(false),
+              isConsumable: const Value(true),
+              seedPackSize: Value(tier.seedPackSize),
+              priceCoins: Value(tier.priceCoins),
+              displayOrder: Value(spec.displayOrder),
+            ),
+          );
+    }
+  }
+
+  // Pulls catalog-managed fields (symbol/name/decimalPlaces) forward onto
+  // any existing currency rows whose codes match the catalog. Catches
+  // installs that pre-date a catalog change — e.g. TWD's symbol going from
+  // "NT$" to "$" — without disturbing the user-controlled isBase/isActive
+  // state. Codes not in the catalog are left alone.
+  Future<void> _resyncCurrencyCatalog() async {
+    final existing = await _db.select(_db.currencies).get();
+    for (final row in existing) {
+      final spec = CurrencyCatalog.findByCode(row.code);
+      if (spec == null) continue;
+      final bool drifted = row.symbol != spec.symbol ||
+          row.name != spec.name ||
+          row.decimalPlaces != spec.decimalPlaces;
+      if (!drifted) continue;
+      await (_db.update(_db.currencies)..where((t) => t.code.equals(row.code)))
+          .write(
+        CurrenciesCompanion(
+          symbol: Value(spec.symbol),
+          name: Value(spec.name),
+          decimalPlaces: Value(spec.decimalPlaces),
+        ),
+      );
     }
   }
 }

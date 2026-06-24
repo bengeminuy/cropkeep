@@ -4,7 +4,10 @@ import 'package:google_fonts/google_fonts.dart';
 import 'app_scope.dart';
 import 'data/database.dart';
 import 'data/repositories/app_settings_repository.dart';
+import 'data/repositories/income_entry_repository.dart';
+import 'data/repositories/market_repository.dart';
 import 'data/repositories/savings_barn_repository.dart';
+import 'data/repositories/transaction_repository.dart';
 import 'data/xp_curve.dart';
 import 'screens/farm_screen.dart';
 import 'screens/farmer_screen.dart';
@@ -22,10 +25,16 @@ Future<void> main() async {
   final appSettings = AppSettingsRepository(database);
   await appSettings.ensureSeeded();
   final savingsBarn = SavingsBarnRepository(database);
+  final transactions = TransactionRepository(database);
+  final incomeEntries = IncomeEntryRepository(database);
+  final market = MarketRepository(database);
   runApp(CropkeepApp(
     database: database,
     appSettings: appSettings,
     savingsBarn: savingsBarn,
+    transactions: transactions,
+    incomeEntries: incomeEntries,
+    market: market,
   ));
 }
 
@@ -35,11 +44,17 @@ class CropkeepApp extends StatelessWidget {
     required this.database,
     required this.appSettings,
     required this.savingsBarn,
+    required this.transactions,
+    required this.incomeEntries,
+    required this.market,
   });
 
   final AppDatabase database;
   final AppSettingsRepository appSettings;
   final SavingsBarnRepository savingsBarn;
+  final TransactionRepository transactions;
+  final IncomeEntryRepository incomeEntries;
+  final MarketRepository market;
 
   @override
   Widget build(BuildContext context) {
@@ -47,6 +62,9 @@ class CropkeepApp extends StatelessWidget {
       database: database,
       appSettings: appSettings,
       savingsBarn: savingsBarn,
+      transactions: transactions,
+      incomeEntries: incomeEntries,
+      market: market,
       child: MaterialApp(
         title: 'Cropkeep',
         debugShowCheckedModeBanner: false,

@@ -1,7 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import '../app_scope.dart';
+import '../data/database.dart';
 import '../theme/colors.dart';
+import '../data/tables/wells.dart' show WellType;
+import 'farm/general_spending_breakdown_screen.dart';
+import 'farm/new_plot_screen.dart';
+import 'farm/new_well_screen.dart';
+import 'farm/plot_breakdown_screen.dart';
 
 // ──────────────────────────────────────────────────────────────────────────
 // FarmScreen — first visual pass.
@@ -25,11 +32,6 @@ class FarmScreen extends StatefulWidget {
 class _FarmScreenState extends State<FarmScreen> {
   late final PageController _pageController;
   int _index = 0;
-
-  // For the layout pass: pretend the bonus pool is above the nudge threshold
-  // so the dot on the Wells segment renders. Real trigger lands with data
-  // wiring.
-  static const bool _bonusPoolNudge = true;
 
   @override
   void initState() {
@@ -68,35 +70,96 @@ class _FarmScreenState extends State<FarmScreen> {
     // gap on notch iPhones between the header and the segment control.
     return Scaffold(
       backgroundColor: CropkeepColors.bgScreen,
-      body: Column(
-        children: [
-          Padding(
-            // 8px top so the segment couples to the header (header has
-            // 8px internal bottom padding → ~16px reading gap, the
-            // standard Material tabs-under-header pattern).
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-            child: _SubpageSegmentedControl(
-              index: _index,
-              bonusPoolNudge: _bonusPoolNudge,
-              onSelected: _selectSegment,
+      body: _BaseCurrencyProvider(
+        child: Column(
+          children: [
+            Padding(
+              // 8px top so the segment couples to the header (header has
+              // 8px internal bottom padding → ~16px reading gap, the
+              // standard Material tabs-under-header pattern).
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: _SubpageSegmentedControl(
+                index: _index,
+                onSelected: _selectSegment,
+              ),
             ),
-          ),
-          const SizedBox(height: 4),
-          _PageIndicatorDots(index: _index, count: 2),
-          Expanded(
-            child: PageView(
-              controller: _pageController,
-              onPageChanged: _onPageChanged,
-              children: const [
-                _CropsSubpage(),
-                _WellsSubpage(),
-              ],
+            const SizedBox(height: 4),
+            _PageIndicatorDots(index: _index, count: 2),
+            Expanded(
+              child: PageView(
+                controller: _pageController,
+                onPageChanged: _onPageChanged,
+                children: const [
+                  _CropsSubpage(),
+                  _WellsSubpage(),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
+}
+
+// Wires app-settings → base currency once, exposes the {symbol, decimals}
+// pair as an InheritedWidget so every nested money render reads the same
+// values. Folds two nested StreamBuilders into the child so the rest of
+// the screen never threads currency through constructors.
+class _BaseCurrencyProvider extends StatelessWidget {
+  const _BaseCurrencyProvider({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final scope = AppScope.of(context);
+    return StreamBuilder<AppSettingsRow?>(
+      stream: scope.appSettings.watch(),
+      builder: (context, settingsSnap) {
+        final String? code = settingsSnap.data?.baseCurrencyCode;
+        return StreamBuilder<CurrencyRow?>(
+          stream: _watchBaseCurrency(scope.database, code),
+          builder: (context, currencySnap) {
+            final currency = currencySnap.data;
+            return _BaseCurrencyScope(
+              symbol: currency?.symbol ?? r'$',
+              decimals: currency?.decimalPlaces ?? 2,
+              child: child,
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _BaseCurrencyScope extends InheritedWidget {
+  const _BaseCurrencyScope({
+    required this.symbol,
+    required this.decimals,
+    required super.child,
+  });
+
+  final String symbol;
+  final int decimals;
+
+  static _BaseCurrencyScope of(BuildContext context) {
+    final scope =
+        context.dependOnInheritedWidgetOfExactType<_BaseCurrencyScope>();
+    assert(scope != null, '_BaseCurrencyScope missing — wrap with _BaseCurrencyProvider.');
+    return scope!;
+  }
+
+  @override
+  bool updateShouldNotify(_BaseCurrencyScope old) =>
+      symbol != old.symbol || decimals != old.decimals;
+}
+
+Stream<CurrencyRow?> _watchBaseCurrency(AppDatabase db, String? code) {
+  if (code == null) return Stream<CurrencyRow?>.value(null);
+  return (db.select(db.currencies)..where((t) => t.code.equals(code)))
+      .watchSingleOrNull();
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -106,12 +169,10 @@ class _FarmScreenState extends State<FarmScreen> {
 class _SubpageSegmentedControl extends StatelessWidget {
   const _SubpageSegmentedControl({
     required this.index,
-    required this.bonusPoolNudge,
     required this.onSelected,
   });
 
   final int index;
-  final bool bonusPoolNudge;
   final ValueChanged<int> onSelected;
 
   @override
@@ -135,9 +196,6 @@ class _SubpageSegmentedControl extends StatelessWidget {
             child: _SegmentTab(
               label: 'Wells',
               isActive: index == 1,
-              // The dot only nudges while the user is on the OTHER tab — once
-              // they're on Wells, no need to keep poking.
-              showDot: bonusPoolNudge && index != 1,
               onTap: () => onSelected(1),
             ),
           ),
@@ -186,12 +244,10 @@ class _SegmentTab extends StatelessWidget {
     required this.label,
     required this.isActive,
     required this.onTap,
-    this.showDot = false,
   });
 
   final String label;
   final bool isActive;
-  final bool showDot;
   final VoidCallback onTap;
 
   @override
@@ -208,39 +264,17 @@ class _SegmentTab extends StatelessWidget {
           borderRadius: BorderRadius.circular(10),
         ),
         alignment: Alignment.center,
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              label,
-              style: TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 13,
-                fontWeight: isActive ? FontWeight.w700 : FontWeight.w600,
-                color: isActive
-                    ? CropkeepColors.textOnGreenBtn
-                    : CropkeepColors.textNavInactive,
-                height: 1,
-              ),
-            ),
-            if (showDot) ...[
-              const SizedBox(width: 6),
-              // Bonus = gold in this system, so the nudge is gold not red —
-              // it should read as "good news to claim" rather than danger.
-              // 2px white halo lets the dot survive on both the green-active
-              // segment and the cream-toned inactive segment.
-              Container(
-                width: 11,
-                height: 11,
-                decoration: BoxDecoration(
-                  color: CropkeepColors.goldPrimary,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                ),
-              ),
-            ],
-          ],
+        child: Text(
+          label,
+          style: TextStyle(
+            fontFamily: 'Nunito',
+            fontSize: 13,
+            fontWeight: isActive ? FontWeight.w700 : FontWeight.w600,
+            color: isActive
+                ? CropkeepColors.textOnGreenBtn
+                : CropkeepColors.textNavInactive,
+            height: 1,
+          ),
         ),
       ),
     );
@@ -316,6 +350,20 @@ class _CropsSubpageState extends State<_CropsSubpage> {
           _ReservoirHeroBlock(
             total: totalIncome,
             totalSpent: totalSpent,
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => GeneralSpendingBreakdownScreen(
+                  data: GeneralSpendingBreakdownData(
+                    totalIncome: totalIncome,
+                    cycleDay: _cycleDayFake,
+                    cycleLength: _cycleLengthFake,
+                    plots: _samplePlots
+                        .map(_toBreakdownPlot)
+                        .toList(growable: false),
+                  ),
+                ),
+              ),
+            ),
           ),
           const SizedBox(height: 20),
           _PlotFilterChips(
@@ -324,7 +372,10 @@ class _CropsSubpageState extends State<_CropsSubpage> {
             onSelected: (f) => setState(() => _filter = f),
           ),
           const SizedBox(height: 16),
-          _PlotList(plots: _filteredPlots()),
+          _PlotList(
+            plots: _filteredPlots(),
+            totalIncome: totalIncome,
+          ),
         ],
       ),
     );
@@ -360,6 +411,9 @@ class _WellsSubpage extends StatelessWidget {
             wells: _sampleFoundationWells,
             addLabel: 'Add foundation well',
             leadingAsset: 'assets/icons/well.svg',
+            addType: WellType.foundation,
+            reservoirTotal: foundationTotal,
+            bonusLogged: bonusLogged,
           ),
           const SizedBox(height: 20),
           _WellsSectionCard(
@@ -367,6 +421,9 @@ class _WellsSubpage extends StatelessWidget {
             wells: _sampleBonusWells,
             addLabel: 'Add bonus well',
             leadingAsset: 'assets/icons/water-bottle.svg',
+            addType: WellType.bonus,
+            reservoirTotal: foundationTotal,
+            bonusLogged: bonusLogged,
           ),
         ],
       ),
@@ -404,6 +461,7 @@ class _IncomeSummaryBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final int totalIncome = reservoirTotal + bonusLogged;
+    final cur = _BaseCurrencyScope.of(context);
     return _HeroCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -415,7 +473,7 @@ class _IncomeSummaryBlock extends StatelessWidget {
               TextSpan(
                 children: [
                   TextSpan(
-                    text: _formatMoney(totalIncome, r'$', 2),
+                    text: _formatMoney(totalIncome, cur.symbol, cur.decimals),
                     style: const TextStyle(
                       fontFamily: 'Nunito',
                       fontSize: 38,
@@ -452,7 +510,7 @@ class _IncomeSummaryBlock extends StatelessWidget {
               ),
               children: [
                 TextSpan(
-                  text: _formatMoney(reservoirTotal, r'$', 2),
+                  text: _formatMoney(reservoirTotal, cur.symbol, cur.decimals),
                   style: const TextStyle(
                     fontWeight: FontWeight.w800,
                     color: CropkeepColors.textPrimary,
@@ -460,7 +518,7 @@ class _IncomeSummaryBlock extends StatelessWidget {
                 ),
                 const TextSpan(text: ' reservoir + '),
                 TextSpan(
-                  text: _formatMoney(bonusLogged, r'$', 2),
+                  text: _formatMoney(bonusLogged, cur.symbol, cur.decimals),
                   style: const TextStyle(
                     fontWeight: FontWeight.w800,
                     color: CropkeepColors.textGoldDeep,
@@ -500,18 +558,25 @@ class _IncomeSummaryBlock extends StatelessWidget {
 
 // Lives inside _HeroCard so the page-defining number reads as a different
 // kind of object from the white data cards below. Sand chrome + bigger
-// padding/radius/shadow do the work; the trailing chevron preserves the
-// tap-to-breakdown affordance.
+// padding/radius/shadow do the work; a labeled "See breakdown ›" link
+// sits inline with the reference caption at the bottom as the
+// tap-to-breakdown affordance. The label (rather than a bare chevron) is
+// what differentiates this hero from the Wells subpage's identical-looking
+// summary hero, which is informational and not tappable — without the
+// label, "is this clickable?" would be a guessing game between two cards
+// of the same shape and tone.
 class _ReservoirHeroBlock extends StatelessWidget {
   const _ReservoirHeroBlock({
     required this.total,
     required this.totalSpent,
+    required this.onTap,
   });
 
   final int total;
   // Sum of every non-deleted transaction this cycle, across all plots
   // including Unplanned. The water that has actually left the reservoir.
   final int totalSpent;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -523,30 +588,14 @@ class _ReservoirHeroBlock extends StatelessWidget {
       button: true,
       label: 'View reservoir breakdown',
       child: _HeroCard(
-        onTap: () => _comingSoon(
-          context,
-          'Reservoir breakdown is coming soon.',
-        ),
+        onTap: onTap,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                Expanded(
-                  child: _ReservoirHeroLine(
-                    isOver: isOver,
-                    remaining: remaining,
-                    overrun: overrun,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                const Icon(
-                  Icons.chevron_right_rounded,
-                  size: 20,
-                  color: CropkeepColors.textSecondaryOnHero,
-                ),
-              ],
+            _ReservoirHeroLine(
+              isOver: isOver,
+              remaining: remaining,
+              overrun: overrun,
             ),
             const SizedBox(height: 14),
             _ReservoirProgressBar(
@@ -557,7 +606,25 @@ class _ReservoirHeroBlock extends StatelessWidget {
               cycleLength: _cycleLengthFake,
             ),
             const SizedBox(height: 12),
-            _ReservoirReferenceCaption(total: total),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(child: _ReservoirReferenceCaption(total: total)),
+                const SizedBox(width: 12),
+                const Text(
+                  'See breakdown',
+                  style: TextStyle(
+                    fontFamily: 'Nunito',
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: CropkeepColors.textSecondaryOnHero,
+                    height: 1,
+                  ),
+                ),
+                const SizedBox(width: 2),
+                const _ForwardChevron(onHero: true),
+              ],
+            ),
           ],
         ),
       ),
@@ -580,6 +647,7 @@ class _ReservoirHeroLine extends StatelessWidget {
   Widget build(BuildContext context) {
     final int heroAmount = isOver ? overrun : remaining;
     final String descriptor = isOver ? 'over' : 'remaining';
+    final cur = _BaseCurrencyScope.of(context);
     // Deep siblings used here because the hero sits on bgHero (warm sand).
     // The bright primaries (textGreen / textRed) have cool undertones that
     // clash against the sand's yellow undertone; the deep variants land
@@ -595,7 +663,7 @@ class _ReservoirHeroLine extends StatelessWidget {
         TextSpan(
           children: [
             TextSpan(
-              text: _formatMoney(heroAmount, r'$', 2),
+              text: _formatMoney(heroAmount, cur.symbol, cur.decimals),
               style: TextStyle(
                 fontFamily: 'Nunito',
                 fontSize: 38,
@@ -705,6 +773,7 @@ class _ReservoirReferenceCaption extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final cur = _BaseCurrencyScope.of(context);
     return Text.rich(
       TextSpan(
         style: const TextStyle(
@@ -717,7 +786,7 @@ class _ReservoirReferenceCaption extends StatelessWidget {
         children: [
           const TextSpan(text: 'of '),
           TextSpan(
-            text: _formatMoney(total, r'$', 2),
+            text: _formatMoney(total, cur.symbol, cur.decimals),
             style: const TextStyle(
               fontWeight: FontWeight.w800,
               color: CropkeepColors.textPrimary,
@@ -854,9 +923,13 @@ class _FilterChip extends StatelessWidget {
 // row layouts).
 
 class _PlotList extends StatelessWidget {
-  const _PlotList({required this.plots});
+  const _PlotList({required this.plots, required this.totalIncome});
 
   final List<_SamplePlot> plots;
+  // Cycle's full income (foundation + logged bonus). Plot rows pass it
+  // along to PlotBreakdownScreen so the Unplanned drill-down can render
+  // "of $X income · X% of income" without re-deriving the figure.
+  final int totalIncome;
 
   @override
   Widget build(BuildContext context) {
@@ -867,17 +940,41 @@ class _PlotList extends StatelessWidget {
           if (i > 0) const SizedBox(height: 12),
           _PlotRow(
             plot: plots[i],
-            onTap: () => _comingSoon(
-              context,
-              '${plots[i].name} — details coming soon.',
-            ),
+            onTap: () => _openPlotBreakdown(context, plots[i]),
           ),
         ],
         const SizedBox(height: 12),
         _AddPlotRow(
-          onTap: () => _comingSoon(context, 'Plot creation is coming soon.'),
+          onTap: () => _openNewPlot(context),
         ),
       ],
+    );
+  }
+
+  // Reservoir cap = foundation only; bonus never counts toward what plots
+  // can be allocated against. Allocation sums every existing non-Unplanned
+  // plot's budget — Unplanned has no pre-allocated budget so it's excluded.
+  void _openNewPlot(BuildContext context) {
+    final int allocatedSoFar = _samplePlots
+        .where((p) => !p.isUnplanned)
+        .fold<int>(0, (sum, p) => sum + (p.budget ?? 0));
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NewPlotScreen(
+          reservoirTotal: _sampleFoundationTotal,
+          allocatedSoFar: allocatedSoFar,
+        ),
+      ),
+    );
+  }
+
+  void _openPlotBreakdown(BuildContext context, _SamplePlot plot) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => PlotBreakdownScreen(
+          data: _toPlotBreakdownData(plot, totalIncome: totalIncome),
+        ),
+      ),
     );
   }
 }
@@ -902,6 +999,7 @@ class _PlotRow extends StatelessWidget {
       plot.state,
       isUnplanned: plot.isUnplanned,
     );
+    final cur = _BaseCurrencyScope.of(context);
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -926,23 +1024,33 @@ class _PlotRow extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            SizedBox(
+            Container(
               width: 52,
               height: 52,
+              padding: const EdgeInsets.all(5),
+              decoration: BoxDecoration(
+                // Placeholder until the plot-color picker + Market unlocks
+                // land. Real value will come from plots.plot_color_id (see
+                // database.md). The swatch lives behind the icon, not as
+                // the tile bg, so it doesn't fight the state-driven
+                // background painted by _PlotVisuals.
+                color: plot.swatch,
+                borderRadius: BorderRadius.circular(12),
+              ),
               child: SvgPicture.asset(
                 plot.iconAsset,
                 fit: BoxFit.contain,
               ),
             ),
             const SizedBox(width: 14),
-            Expanded(child: _content(visuals)),
+            Expanded(child: _content(visuals, cur)),
           ],
         ),
       ),
     );
   }
 
-  Widget _content(_PlotVisuals visuals) {
+  Widget _content(_PlotVisuals visuals, _BaseCurrencyScope cur) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -966,20 +1074,28 @@ class _PlotRow extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            _headlineAmount(),
+            _headlineAmount(cur),
           ],
         ),
         const SizedBox(height: 8),
         _PlotProgressBar(plot: plot),
         const SizedBox(height: 6),
-        _statusLine(visuals.statusColor),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Expanded(child: _statusLine(visuals.statusColor, cur)),
+            const SizedBox(width: 8),
+            const _ForwardChevron(onHero: false),
+          ],
+        ),
       ],
     );
   }
 
-  Widget _headlineAmount() {
+  Widget _headlineAmount(_BaseCurrencyScope cur) {
     if (plot.isUnplanned) {
       return _amount(
+        cur: cur,
         amount: plot.spent,
         descriptor: 'spent',
         amountColor: CropkeepColors.textPrimary,
@@ -987,6 +1103,7 @@ class _PlotRow extends StatelessWidget {
     }
     if (plot.kind == _PlotKind.fixedObligation) {
       return _amount(
+        cur: cur,
         amount: plot.budget ?? 0,
         descriptor: _fixedObligationDescriptor(),
         amountColor: CropkeepColors.textPrimary,
@@ -995,6 +1112,7 @@ class _PlotRow extends StatelessWidget {
     final remaining = (plot.budget ?? 0) - plot.spent;
     final bool isOver = remaining < 0;
     return _amount(
+      cur: cur,
       amount: remaining.abs(),
       descriptor: isOver ? 'over' : 'left',
       amountColor:
@@ -1003,6 +1121,7 @@ class _PlotRow extends StatelessWidget {
   }
 
   Widget _amount({
+    required _BaseCurrencyScope cur,
     required int amount,
     required String descriptor,
     required Color amountColor,
@@ -1018,7 +1137,7 @@ class _PlotRow extends StatelessWidget {
         ),
         children: [
           TextSpan(
-            text: _formatMoney(amount, r'$', 2),
+            text: _formatMoney(amount, cur.symbol, cur.decimals),
             style: TextStyle(
               fontSize: 15,
               fontWeight: FontWeight.w800,
@@ -1046,7 +1165,7 @@ class _PlotRow extends StatelessWidget {
     }
   }
 
-  Widget _statusLine(Color statusColor) {
+  Widget _statusLine(Color statusColor, _BaseCurrencyScope cur) {
     final String text;
     if (plot.isUnplanned) {
       text =
@@ -1062,7 +1181,7 @@ class _PlotRow extends StatelessWidget {
       final int remaining = budget - plot.spent;
       if (remaining > 0) {
         final pace = remaining ~/ _daysLeftFake;
-        text = '≈${_formatMoney(pace, r'$', 2)}/day to stay on track';
+        text = '≈${_formatMoney(pace, cur.symbol, cur.decimals)}/day to stay on track';
       } else {
         text = 'Withering';
       }
@@ -1355,6 +1474,9 @@ class _WellsSectionCard extends StatelessWidget {
     required this.wells,
     required this.addLabel,
     required this.leadingAsset,
+    required this.addType,
+    required this.reservoirTotal,
+    required this.bonusLogged,
   });
 
   final String title;
@@ -1364,6 +1486,12 @@ class _WellsSectionCard extends StatelessWidget {
   // section header in the same visual language as the row icons and gives
   // wayfinding a quiet, brand-consistent touch.
   final String leadingAsset;
+  // Drives the Add row: which kind of well NewWellScreen lands on, and
+  // the context numbers the screen header needs to render the reservoir
+  // / bonus-pool headline.
+  final WellType addType;
+  final int reservoirTotal;
+  final int bonusLogged;
 
   @override
   Widget build(BuildContext context) {
@@ -1371,6 +1499,7 @@ class _WellsSectionCard extends StatelessWidget {
       0,
       (sum, w) => sum + w.loggedThisCycle,
     );
+    final cur = _BaseCurrencyScope.of(context);
     return _SectionCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1395,7 +1524,7 @@ class _WellsSectionCard extends StatelessWidget {
                   ),
                   children: [
                     TextSpan(
-                      text: _formatMoney(sectionTotal, r'$', 2),
+                      text: _formatMoney(sectionTotal, cur.symbol, cur.decimals),
                       style: const TextStyle(
                         fontWeight: FontWeight.w700,
                         color: CropkeepColors.textPrimary,
@@ -1422,7 +1551,12 @@ class _WellsSectionCard extends StatelessWidget {
             thickness: 1,
             color: CropkeepColors.borderDivider,
           ),
-          _AddWellRow(label: addLabel),
+          _AddWellRow(
+            label: addLabel,
+            type: addType,
+            reservoirTotal: reservoirTotal,
+            bonusLogged: bonusLogged,
+          ),
         ],
       ),
     );
@@ -1436,12 +1570,18 @@ class _WellRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final Color iconBg = well.isBonus
-        ? CropkeepColors.bgGoldWash
-        : CropkeepColors.greenHint;
     final String trailingCaption =
         well.isCarryover ? 'Rolled over' : 'This cycle';
+    final cur = _BaseCurrencyScope.of(context);
 
+    // Row icons were redundant — every foundation row showed the same
+    // well.svg, every bonus row the same water-bottle.svg, so the 44×44
+    // tinted circle was repeating what the section header glyph + title
+    // already said. The header glyph now does the category wayfinding
+    // alone; rows lead with their name. The carryover signal that used
+    // to ride a corner badge on the icon moves inline as a small ↻ glyph
+    // next to the well name (kept tonally via textGoldDeep) so the row
+    // still pre-attentively reads as "this is the carryover well."
     return InkWell(
       onTap: () => _comingSoon(
         context,
@@ -1457,67 +1597,39 @@ class _WellRow extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Stack(
-              clipBehavior: Clip.none,
-              children: [
-                Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: iconBg,
-                    shape: BoxShape.circle,
-                  ),
-                  alignment: Alignment.center,
-                  child: SvgPicture.asset(
-                    well.iconAsset,
-                    width: 28,
-                    height: 28,
-                    fit: BoxFit.contain,
-                  ),
-                ),
-                if (well.isCarryover)
-                  Positioned(
-                    right: -2,
-                    bottom: -2,
-                    child: Container(
-                      width: 18,
-                      height: 18,
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: CropkeepColors.goldPrimary,
-                          width: 1.5,
-                        ),
-                      ),
-                      alignment: Alignment.center,
-                      child: SvgPicture.asset(
-                        'assets/icons/carryover.svg',
-                        width: 11,
-                        height: 11,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(width: 12),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    well.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontFamily: 'Nunito',
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                      color: CropkeepColors.textPrimary,
-                      height: 1.2,
-                    ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      if (well.isCarryover) ...[
+                        SvgPicture.asset(
+                          'assets/icons/carryover v2.svg',
+                          width: 14,
+                          height: 14,
+                          fit: BoxFit.contain,
+                        ),
+                        const SizedBox(width: 6),
+                      ],
+                      Flexible(
+                        child: Text(
+                          well.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontFamily: 'Nunito',
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: CropkeepColors.textPrimary,
+                            height: 1.2,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                   if (well.subtitle != null) ...[
                     const SizedBox(height: 2),
@@ -1555,7 +1667,7 @@ class _WellRow extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  _formatMoney(well.loggedThisCycle, r'$', 2),
+                  _formatMoney(well.loggedThisCycle, cur.symbol, cur.decimals),
                   style: const TextStyle(
                     fontFamily: 'Nunito',
                     fontSize: 15,
@@ -1578,14 +1690,34 @@ class _WellRow extends StatelessWidget {
 // small cream pill so the row reads as a chip-style CTA rather than another
 // list entry.
 class _AddWellRow extends StatelessWidget {
-  const _AddWellRow({required this.label});
+  const _AddWellRow({
+    required this.label,
+    required this.type,
+    required this.reservoirTotal,
+    required this.bonusLogged,
+  });
 
   final String label;
+  final WellType type;
+  final int reservoirTotal;
+  final int bonusLogged;
+
+  void _openNewWell(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NewWellScreen(
+          type: type,
+          reservoirTotal: reservoirTotal,
+          bonusLogged: bonusLogged,
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
-      onTap: () => _comingSoon(context, '$label — coming soon.'),
+      onTap: () => _openNewWell(context),
       borderRadius: BorderRadius.circular(8),
       // Asymmetric padding (20 top / 4 bottom) so the content sits visually
       // centered between the divider above and the card edge below: the
@@ -1640,10 +1772,12 @@ class _SamplePlot {
     required this.spent,
     required this.state,
     required this.kind,
+    this.swatch = CropkeepColors.greenHint,
     this.statusLabel,
     this.dueDay,
     this.isUnplanned = false,
     this.incomeSharePct,
+    this.transactions = const [],
   });
 
   final String name;
@@ -1652,10 +1786,31 @@ class _SamplePlot {
   final int spent;
   final _PlotVisualState state;
   final _PlotKind kind;
+  // Cosmetic backdrop painted behind the plot's crop icon on the Crops
+  // row. Default is the same wash the new-plot form previews ("Default
+  // green"). Once the picker + Market unlocks land, this maps from
+  // plots.plot_color_id.
+  final Color swatch;
   final String? statusLabel;
   final int? dueDay;
   final bool isUnplanned;
   final double? incomeSharePct;
+  // Hardcoded transactions for the plot-breakdown drill-down. Amounts must
+  // sum to `spent` so the breakdown's "of $X spent" totals reconcile with
+  // the Crops row. Replaced by repository data once wiring lands.
+  final List<_SampleTransaction> transactions;
+}
+
+class _SampleTransaction {
+  const _SampleTransaction({
+    required this.description,
+    required this.amount,
+    required this.cycleDay,
+  });
+
+  final String description;
+  final int amount;
+  final int cycleDay;
 }
 
 class _SampleWell {
@@ -1676,6 +1831,55 @@ class _SampleWell {
   final bool isCarryover;
 }
 
+// Maps the local sample types to the breakdown screen's public model. Lives
+// at the data-shape boundary so the breakdown screen stays decoupled from
+// farm_screen's private types.
+BreakdownPlot _toBreakdownPlot(_SamplePlot p) => BreakdownPlot(
+      name: p.name,
+      iconAsset: p.iconAsset,
+      spent: p.spent,
+      kind: _toBreakdownKind(p),
+    );
+
+BreakdownPlotKind _toBreakdownKind(_SamplePlot p) {
+  if (p.isUnplanned) return BreakdownPlotKind.unplanned;
+  switch (p.kind) {
+    case _PlotKind.discretionary:
+      return BreakdownPlotKind.discretionary;
+    case _PlotKind.fixedObligation:
+      return BreakdownPlotKind.fixedObligation;
+  }
+}
+
+// Maps the local sample plot to the per-plot breakdown screen's public
+// model. Mirrors _toBreakdownPlot — keeps the drill-down screen decoupled
+// from farm_screen's private types.
+PlotBreakdownData _toPlotBreakdownData(
+  _SamplePlot p, {
+  required int totalIncome,
+}) {
+  return PlotBreakdownData(
+    plotName: p.name,
+    iconAsset: p.iconAsset,
+    kind: _toBreakdownKind(p),
+    budget: p.budget,
+    cycleDay: _cycleDayFake,
+    cycleLength: _cycleLengthFake,
+    // Demo cycle starts on a Monday (DateTime.monday == 1). Replaced by
+    // the active cycle's real start weekday once data wiring lands.
+    cycleStartWeekday: DateTime.monday,
+    transactions: p.transactions
+        .map((t) => PlotBreakdownTransaction(
+              description: t.description,
+              amount: t.amount,
+              cycleDay: t.cycleDay,
+            ))
+        .toList(growable: false),
+    totalIncome: p.isUnplanned ? totalIncome : null,
+    incomeSharePct: p.isUnplanned ? p.incomeSharePct : null,
+  );
+}
+
 // Foundation total: Salary 4,000.00 + Rental 800.00 = 4,800.00.
 const int _sampleFoundationTotal = 480000;
 
@@ -1692,8 +1896,23 @@ const List<_SamplePlot> _samplePlots = [
     spent: 4500,
     state: _PlotVisualState.growing,
     kind: _PlotKind.discretionary,
+    // Sand-tone swatch — the wild patch doesn't belong to a category, so
+    // it reads as neutral ground rather than a chosen color.
+    swatch: Color(0xFFE6D8BC),
     isUnplanned: true,
     incomeSharePct: 3.2,
+    transactions: [
+      _SampleTransaction(
+        description: 'Phone charger replacement',
+        amount: 2500,
+        cycleDay: 4,
+      ),
+      _SampleTransaction(
+        description: 'Late-night taxi',
+        amount: 2000,
+        cycleDay: 12,
+      ),
+    ],
   ),
   _SamplePlot(
     name: 'Fun money',
@@ -1702,6 +1921,29 @@ const List<_SamplePlot> _samplePlots = [
     spent: 15800,
     state: _PlotVisualState.withering,
     kind: _PlotKind.discretionary,
+    swatch: Color(0xFFE1D4F0),
+    transactions: [
+      _SampleTransaction(
+        description: 'Concert tickets',
+        amount: 8000,
+        cycleDay: 9,
+      ),
+      _SampleTransaction(
+        description: 'Vinyl record',
+        amount: 3500,
+        cycleDay: 14,
+      ),
+      _SampleTransaction(
+        description: 'Bar tab',
+        amount: 2800,
+        cycleDay: 6,
+      ),
+      _SampleTransaction(
+        description: 'Magazine',
+        amount: 1500,
+        cycleDay: 2,
+      ),
+    ],
   ),
   _SamplePlot(
     name: 'Transport',
@@ -1710,6 +1952,24 @@ const List<_SamplePlot> _samplePlots = [
     spent: 26000,
     state: _PlotVisualState.almostFull,
     kind: _PlotKind.discretionary,
+    swatch: Color(0xFFCFE3F2),
+    transactions: [
+      _SampleTransaction(
+        description: 'Monthly transit pass',
+        amount: 12000,
+        cycleDay: 1,
+      ),
+      _SampleTransaction(
+        description: 'Gas refill',
+        amount: 8500,
+        cycleDay: 11,
+      ),
+      _SampleTransaction(
+        description: 'Uber rides',
+        amount: 5500,
+        cycleDay: 13,
+      ),
+    ],
   ),
   _SamplePlot(
     name: 'Food',
@@ -1718,6 +1978,34 @@ const List<_SamplePlot> _samplePlots = [
     spent: 32000,
     state: _PlotVisualState.growing,
     kind: _PlotKind.discretionary,
+    swatch: Color(0xFFFFD9B8),
+    transactions: [
+      _SampleTransaction(
+        description: 'Weekly groceries',
+        amount: 14000,
+        cycleDay: 7,
+      ),
+      _SampleTransaction(
+        description: 'Lunch out',
+        amount: 6500,
+        cycleDay: 10,
+      ),
+      _SampleTransaction(
+        description: 'Coffee runs',
+        amount: 4500,
+        cycleDay: 15,
+      ),
+      _SampleTransaction(
+        description: 'Takeout dinner',
+        amount: 4000,
+        cycleDay: 5,
+      ),
+      _SampleTransaction(
+        description: 'Snacks',
+        amount: 3000,
+        cycleDay: 3,
+      ),
+    ],
   ),
   _SamplePlot(
     name: 'Rent',
@@ -1726,8 +2014,16 @@ const List<_SamplePlot> _samplePlots = [
     spent: 150000,
     state: _PlotVisualState.ready,
     kind: _PlotKind.fixedObligation,
+    swatch: Color(0xFFFFCFD0),
     statusLabel: 'Paid · day 5',
     dueDay: 5,
+    transactions: [
+      _SampleTransaction(
+        description: 'Monthly rent',
+        amount: 150000,
+        cycleDay: 5,
+      ),
+    ],
   ),
   _SamplePlot(
     name: 'Subscriptions',
@@ -1736,6 +2032,7 @@ const List<_SamplePlot> _samplePlots = [
     spent: 0,
     state: _PlotVisualState.seedling,
     kind: _PlotKind.fixedObligation,
+    swatch: Color(0xFFFFE9A8),
     statusLabel: 'Awaiting · day 15',
     dueDay: 15,
   ),
@@ -1869,6 +2166,29 @@ class _SectionCard extends StatelessWidget {
         shape: _shape,
         child: Padding(padding: _padding, child: child),
       ),
+    );
+  }
+}
+
+// Trailing affordance on tappable cards. Sits at the bottom-right inline
+// with the reference caption / row status line so it never fights the
+// headline number for visual weight. Sand-bg cards (hero) use the deeper
+// sand-tinted secondary; white/cream data rows use the standard neutral
+// secondary. Size tracks the neighboring text size so the chevron reads
+// as a peer to the caption rather than a separate UI element.
+class _ForwardChevron extends StatelessWidget {
+  const _ForwardChevron({required this.onHero});
+
+  final bool onHero;
+
+  @override
+  Widget build(BuildContext context) {
+    return Icon(
+      Icons.chevron_right_rounded,
+      size: onHero ? 20 : 18,
+      color: onHero
+          ? CropkeepColors.textSecondaryOnHero
+          : CropkeepColors.textSecondary,
     );
   }
 }

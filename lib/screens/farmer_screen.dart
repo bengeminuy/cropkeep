@@ -5,10 +5,12 @@ import 'package:flutter_svg/flutter_svg.dart';
 import '../app_scope.dart';
 import '../data/currency_catalog.dart';
 import '../data/database.dart';
+import '../data/dev/dummy_data_seeder.dart';
 import '../data/tables/cycle_summaries.dart';
 import '../data/tables/plot_cycle_results.dart';
 import '../data/xp_curve.dart';
 import '../theme/colors.dart';
+import '../theme/plot_swatches.dart';
 import '../widgets/avatar_picker_sheet.dart';
 import '../widgets/secondary_currency_picker_sheet.dart';
 
@@ -735,20 +737,24 @@ _HarvestEntry _harvestEntryFrom({
   required CycleRow cycle,
   required List<PlotCycleResultRow> plotResults,
 }) {
-  PlotFinalState? unplannedState;
-  final regular = <PlotFinalState>[];
+  _HarvestPlot? unplanned;
+  final regular = <_HarvestPlot>[];
   for (final p in plotResults) {
+    final hp = _HarvestPlot(
+      state: p.finalState,
+      swatch: plotSwatchFor(p.plotColorIdSnapshot),
+    );
     if (p.isUnplanned) {
-      unplannedState = p.finalState;
+      unplanned = hp;
     } else {
-      regular.add(p.finalState);
+      regular.add(hp);
     }
   }
   return _HarvestEntry(
     startDate: DateTime.fromMillisecondsSinceEpoch(cycle.startDate),
     tier: summary.resultTier,
     surplus: summary.surplus,
-    unplanned: unplannedState,
+    unplanned: unplanned,
     plots: regular,
   );
 }
@@ -765,12 +771,24 @@ class _HarvestEntry {
   final DateTime startDate;
   final CycleResultTier tier;
   final int surplus; // in minor units; negative for deficit
-  final PlotFinalState? unplanned;
-  final List<PlotFinalState> plots;
+  final _HarvestPlot? unplanned;
+  final List<_HarvestPlot> plots;
 
   String get monthLabel => _monthAbbrev[startDate.month - 1];
   int get year => startDate.year;
 }
+
+// Per-plot snapshot the harvest strip renders. Pairs the cosmetic
+// identity (swatch, from plot_color_id_snapshot) with the actionable
+// signal (final state).
+class _HarvestPlot {
+  const _HarvestPlot({required this.state, required this.swatch});
+  final PlotFinalState state;
+  final Color swatch;
+}
+
+// Plot swatch lookup lives in `theme/plot_swatches.dart` so the Farm,
+// Farmer, and Ledger surfaces all read from one source.
 
 class _TierVisuals {
   const _TierVisuals({
@@ -920,31 +938,38 @@ class _HarvestCard extends StatelessWidget {
 class _PlotStrip extends StatelessWidget {
   const _PlotStrip({required this.unplanned, required this.plots});
 
-  final PlotFinalState? unplanned;
-  final List<PlotFinalState> plots;
+  final _HarvestPlot? unplanned;
+  final List<_HarvestPlot> plots;
 
-  static const double _dotSize = 8;
+  static const double _dotSize = 13;
   static const double _gap = 4;
 
   @override
   Widget build(BuildContext context) {
     final children = <Widget>[];
     if (unplanned != null) {
-      children.add(_PlotDot(state: unplanned!, isUnplanned: true));
+      children.add(_PlotDot(plot: unplanned!, isUnplanned: true));
     }
-    for (final s in plots.take(5)) {
+    for (final p in plots.take(5)) {
       if (children.isNotEmpty) children.add(const SizedBox(width: _gap));
-      children.add(_PlotDot(state: s));
+      children.add(_PlotDot(plot: p));
     }
     return Row(mainAxisSize: MainAxisSize.min, children: children);
   }
 }
 
+// Per-plot summary cell. Two channels stacked in one dot:
+//   • fill   = plot's cosmetic swatch  (identity — which plot was this?)
+//   • border = final-state color       (signal — how did it do?)
+// Unplanned takes a rounded square instead of a circle so the wild
+// patch reads as "not a tended plot" without leaning on color.
 class _PlotDot extends StatelessWidget {
-  const _PlotDot({required this.state, this.isUnplanned = false});
+  const _PlotDot({required this.plot, this.isUnplanned = false});
 
-  final PlotFinalState state;
+  final _HarvestPlot plot;
   final bool isUnplanned;
+
+  static const double _ringWidth = 2;
 
   @override
   Widget build(BuildContext context) {
@@ -952,22 +977,30 @@ class _PlotDot extends StatelessWidget {
       width: _PlotStrip._dotSize,
       height: _PlotStrip._dotSize,
       decoration: BoxDecoration(
-        color: _plotStateColor(state),
+        color: plot.swatch,
         shape: isUnplanned ? BoxShape.rectangle : BoxShape.circle,
-        borderRadius: isUnplanned ? BorderRadius.circular(2) : null,
+        borderRadius: isUnplanned ? BorderRadius.circular(3) : null,
+        border: Border.all(
+          color: _plotStateColor(plot.state),
+          width: _ringWidth,
+        ),
       ),
     );
   }
 }
 
 Color _plotStateColor(PlotFinalState state) {
+  // Solid colors only — the ring is a 2px signal layer and alpha-blended
+  // reds collapse to pink at that width, which confuses the ring with
+  // the swatch fill (identity channel). Severity escalates by *hue*:
+  // green (good) → gold (caution) → brick (warning) → bright red (alarm).
   switch (state) {
     case PlotFinalState.harvested:
       return CropkeepColors.greenPrimary;
     case PlotFinalState.mildStress:
       return CropkeepColors.goldPrimary;
     case PlotFinalState.withered:
-      return CropkeepColors.redAlert.withValues(alpha: 0.55);
+      return CropkeepColors.textRedDeep;
     case PlotFinalState.dead:
       return CropkeepColors.redAlert;
   }
@@ -1063,6 +1096,19 @@ class _SettingsSection extends StatelessWidget {
               );
             },
           ),
+          StreamBuilder<bool>(
+            stream: DummyDataSeeder.watchHasDemo(
+              AppScope.of(context).database,
+            ),
+            builder: (context, snap) {
+              final loaded = snap.data ?? false;
+              return _SettingsRow(
+                label: loaded ? 'Clear demo data' : 'Load demo data',
+                trailingChevron: true,
+                onTap: () => _toggleDemoData(context, loaded),
+              );
+            },
+          ),
           _SettingsRow(
             label: 'Reset',
             trailingChevron: true,
@@ -1094,6 +1140,34 @@ class _SettingsSection extends StatelessWidget {
         duration: const Duration(seconds: 2),
       ),
     );
+  }
+
+  Future<void> _toggleDemoData(BuildContext context, bool loaded) async {
+    final db = AppScope.of(context).database;
+    final messenger = ScaffoldMessenger.of(context);
+    if (loaded) {
+      await DummyDataSeeder.clearDummyData(db);
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Demo data cleared.',
+            style: TextStyle(fontFamily: 'Nunito', fontWeight: FontWeight.w600),
+          ),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } else {
+      await DummyDataSeeder.seedFarmerScreen(db);
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Demo data loaded.',
+            style: TextStyle(fontFamily: 'Nunito', fontWeight: FontWeight.w600),
+          ),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
   }
 
   String _formatBaseValue(String code) {

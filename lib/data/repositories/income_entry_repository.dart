@@ -105,4 +105,14 @@ class IncomeEntryRepository {
           _db.incomeEntries.deletedAt.isNull());
     return query.watchSingle().map((row) => row.read(sum) ?? 0);
   }
+
+  Stream<List<IncomeEntryRow>> watchRecentlyDeleted({
+    Duration window = const Duration(days: 30),
+  }) {
+    final cutoff = DateTime.now().subtract(window).millisecondsSinceEpoch;
+    return (_db.select(_db.incomeEntries)
+          ..where((t) => t.deletedAt.isNotNull() & t.deletedAt.isBiggerThanValue(cutoff))
+          ..orderBy([(t) => OrderingTerm.desc(t.deletedAt)]))
+        .watch();
+  }
 }

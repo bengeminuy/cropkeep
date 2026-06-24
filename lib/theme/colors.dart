@@ -41,6 +41,10 @@ class CropkeepColors {
   static const Color redAlert = Color(0xFFE53030);
   static const Color bluePremium = Color(0xFF5AACDC);
 
+  // Market tier — Common reuses no existing token (greens/blues are spoken for
+  // by uncommon/rare). Warm tan, sister of textNavInactive, reads as unflashy.
+  static const Color tierCommon = Color(0xFF8A7A55);
+
   // Typography
   static const Color textPrimary = Color(0xFF1A1A1A);
   static const Color textSecondary = Color(0xFF888888);
