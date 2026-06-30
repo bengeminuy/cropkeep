@@ -1,52 +1,79 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import '../../screens/market/market_catalog.dart';
 import '../../theme/colors.dart';
 
-// Crop card under a tier section. Tier-level economics (price/yield/
-// break-even) live in the tier header, so the card body is small:
-// name, set membership (info, NOT progress), stock vs. pack max,
-// price + Buy CTA. When `canAfford == false` the icon fades to 60%
-// and the right pill turns sand with "Need N more".
+// Crop card under a tier section.
+//
+// The card is honest about how little it has to say: identity (icon +
+// name), state (your current stock), cost (price), action (Buy / Need).
+// Earlier passes tried to fill a four-element vertical stack which left
+// either a hollow middle or asymmetric spacing once set info was
+// pulled out. This pass gives the right column two parallel lanes
+// instead:
+//   • Top lane  — Name           …  Stock chip
+//   • Bottom    — Price          …  Buy CTA / "Need N more"
+// Each lane pairs "what" on the left with "how much / do it" on the
+// right, and the two rows mirror each other so the eye reads the card
+// as two parallel beats rather than a thin scroll of disconnected
+// fields. No divider is needed — the row rhythm carries the
+// separation, and the icon tile sits vertically centered as the visual
+// anchor.
+//
+// The icon tile is tinted by tier (warm sand / green / cool blue) with
+// a faint tier-colored border, so each card visually echoes its
+// section header even when the header has scrolled off the top.
 class CropMarketCard extends StatelessWidget {
   const CropMarketCard({
     super.key,
     required this.name,
     required this.iconAsset,
-    required this.setName,
-    required this.setBonusCoins,
+    required this.tier,
     required this.stock,
-    required this.packMax,
     required this.priceCoins,
+    required this.packSize,
     required this.canAfford,
     required this.coinShort,
     this.onBuy,
-    this.previewOnly = false,
-    this.previewNewStock,
   });
 
   final String name;
   final String iconAsset;
-  // Set membership is info, not progress. Set completion happens on
-  // the Farm/Harvest screens.
-  final String setName;
-  final int setBonusCoins;
+  final CropTier tier;
   final int stock;
-  final int packMax;
   final int priceCoins;
+  // Seeds per purchase. Renders on the Buy CTA ("Buy ×5") so the card
+  // is self-contained without leaning on the tier header to disambiguate.
+  final int packSize;
   final bool canAfford;
   final int coinShort;
   final VoidCallback? onBuy;
-  // Drop the CTA + bottom divider when shown inside the confirm sheet.
-  final bool previewOnly;
-  // When previewOnly is true, show "stock N → N+5" instead of just N.
-  final int? previewNewStock;
+
+  Color get _iconTint {
+    switch (tier) {
+      case CropTier.common:
+        return CropkeepColors.bgHero;
+      case CropTier.uncommon:
+        return CropkeepColors.greenHint;
+      case CropTier.rare:
+        return CropkeepColors.bgPageAlt;
+    }
+  }
+
+  Color get _iconBorder {
+    switch (tier) {
+      case CropTier.common:
+        return CropkeepColors.tierCommon;
+      case CropTier.uncommon:
+        return CropkeepColors.greenPrimary;
+      case CropTier.rare:
+        return CropkeepColors.bluePremium;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final String stockLabel = previewOnly && previewNewStock != null
-        ? 'stock $stock → $previewNewStock / $packMax'
-        : 'stock $stock / $packMax';
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -55,84 +82,132 @@ class CropMarketCard extends StatelessWidget {
         border: Border.all(color: CropkeepColors.borderCard, width: 1.5),
       ),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Opacity(
-            opacity: canAfford ? 1.0 : 0.6,
-            child: Container(
-              width: 72,
-              height: 72,
-              decoration: BoxDecoration(
-                color: CropkeepColors.greenHint,
-                borderRadius: BorderRadius.circular(16),
-              ),
-              alignment: Alignment.center,
-              child: SvgPicture.asset(iconAsset, width: 52, height: 52),
-            ),
+          _IconTile(
+            iconAsset: iconAsset,
+            tint: _iconTint,
+            borderColor: _iconBorder,
+            faded: !canAfford,
           ),
           const SizedBox(width: 14),
           Expanded(
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
-                  name,
-                  style: const TextStyle(
-                    fontFamily: 'Nunito',
-                    fontSize: 16,
-                    fontWeight: FontWeight.w800,
-                    color: CropkeepColors.textPrimary,
-                    height: 1.1,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  '$setName · ${setBonusCoins}c set bonus',
-                  style: const TextStyle(
-                    fontFamily: 'Nunito',
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: CropkeepColors.textSecondary,
-                    height: 1,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  stockLabel,
-                  style: const TextStyle(
-                    fontFamily: 'Nunito',
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
-                    color: CropkeepColors.textGreenDeep,
-                    height: 1.2,
-                  ),
-                ),
-                if (previewOnly) ...[
-                  const SizedBox(height: 8),
-                  _PriceLabel(priceCoins: priceCoins),
-                ] else ...[
-                  const SizedBox(height: 10),
-                  const Divider(
-                    height: 1,
-                    thickness: 1,
-                    color: CropkeepColors.borderDivider,
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      _PriceLabel(priceCoins: priceCoins),
-                      const Spacer(),
-                      _BuyPill(
-                        canAfford: canAfford,
-                        coinShort: coinShort,
-                        onTap: onBuy,
-                        atCap: stock >= packMax,
+                // Identity lane.
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        name,
+                        style: const TextStyle(
+                          fontFamily: 'Nunito',
+                          fontSize: 16,
+                          fontWeight: FontWeight.w800,
+                          color: CropkeepColors.textPrimary,
+                          height: 1.1,
+                        ),
                       ),
-                    ],
-                  ),
-                ],
+                    ),
+                    const SizedBox(width: 8),
+                    _StockChip(stock: stock),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                // Commerce lane.
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    _PriceLabel(priceCoins: priceCoins),
+                    const Spacer(),
+                    _BuyTerminal(
+                      canAfford: canAfford,
+                      coinShort: coinShort,
+                      packSize: packSize,
+                      onTap: onBuy,
+                    ),
+                  ],
+                ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _IconTile extends StatelessWidget {
+  const _IconTile({
+    required this.iconAsset,
+    required this.tint,
+    required this.borderColor,
+    required this.faded,
+  });
+
+  final String iconAsset;
+  final Color tint;
+  final Color borderColor;
+  final bool faded;
+
+  @override
+  Widget build(BuildContext context) {
+    return Opacity(
+      opacity: faded ? 0.55 : 1.0,
+      child: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(
+          color: tint,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: borderColor.withValues(alpha: 0.35),
+            width: 1,
+          ),
+        ),
+        alignment: Alignment.center,
+        child: SvgPicture.asset(iconAsset, width: 46, height: 46),
+      ),
+    );
+  }
+}
+
+class _StockChip extends StatelessWidget {
+  const _StockChip({required this.stock});
+
+  final int stock;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool empty = stock == 0;
+    final Color bg = empty
+        ? CropkeepColors.borderDivider
+        : CropkeepColors.greenHint;
+    final Color fg = empty
+        ? CropkeepColors.textSecondary
+        : CropkeepColors.textGreenDeep;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.inventory_2_outlined, size: 12, color: fg),
+          const SizedBox(width: 5),
+          Text(
+            '$stock',
+            style: TextStyle(
+              fontFamily: 'Nunito',
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+              color: fg,
+              height: 1,
             ),
           ),
         ],
@@ -151,13 +226,13 @@ class _PriceLabel extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        SvgPicture.asset('assets/icons/coin.svg', width: 16, height: 16),
+        SvgPicture.asset('assets/icons/coin.svg', width: 17, height: 17),
         const SizedBox(width: 5),
         Text(
           '$priceCoins',
           style: const TextStyle(
             fontFamily: 'Nunito',
-            fontSize: 15,
+            fontSize: 16,
             fontWeight: FontWeight.w800,
             color: CropkeepColors.textGoldDeep,
             height: 1,
@@ -168,40 +243,21 @@ class _PriceLabel extends StatelessWidget {
   }
 }
 
-class _BuyPill extends StatelessWidget {
-  const _BuyPill({
+class _BuyTerminal extends StatelessWidget {
+  const _BuyTerminal({
     required this.canAfford,
     required this.coinShort,
+    required this.packSize,
     required this.onTap,
-    required this.atCap,
   });
 
   final bool canAfford;
   final int coinShort;
+  final int packSize;
   final VoidCallback? onTap;
-  final bool atCap;
 
   @override
   Widget build(BuildContext context) {
-    if (atCap) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
-        decoration: BoxDecoration(
-          color: CropkeepColors.bgPlot,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: const Text(
-          'At pack max',
-          style: TextStyle(
-            fontFamily: 'Nunito',
-            fontSize: 12,
-            fontWeight: FontWeight.w700,
-            color: CropkeepColors.textSecondaryOnHero,
-            height: 1,
-          ),
-        ),
-      );
-    }
     if (canAfford) {
       return GestureDetector(
         behavior: HitTestBehavior.opaque,
@@ -212,9 +268,9 @@ class _BuyPill extends StatelessWidget {
             color: CropkeepColors.greenPrimary,
             borderRadius: BorderRadius.circular(10),
           ),
-          child: const Text(
-            'Buy',
-            style: TextStyle(
+          child: Text(
+            'Buy ×$packSize',
+            style: const TextStyle(
               fontFamily: 'Nunito',
               fontSize: 13,
               fontWeight: FontWeight.w800,
@@ -225,21 +281,15 @@ class _BuyPill extends StatelessWidget {
         ),
       );
     }
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
-      decoration: BoxDecoration(
-        color: CropkeepColors.bgHero,
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Text(
-        'Need $coinShort more',
-        style: const TextStyle(
-          fontFamily: 'Nunito',
-          fontSize: 12,
-          fontWeight: FontWeight.w700,
-          color: CropkeepColors.textSecondaryOnHero,
-          height: 1,
-        ),
+    // Plain text — no rectangular bg, so it doesn't read as a button.
+    return Text(
+      'Need $coinShort more',
+      style: const TextStyle(
+        fontFamily: 'Nunito',
+        fontSize: 12,
+        fontWeight: FontWeight.w700,
+        color: CropkeepColors.textSecondary,
+        height: 1,
       ),
     );
   }

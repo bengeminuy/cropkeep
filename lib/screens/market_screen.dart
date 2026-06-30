@@ -4,17 +4,24 @@ import 'package:flutter/material.dart';
 
 import '../app_scope.dart';
 import '../data/database.dart';
+import '../data/tables/owned_items.dart';
 import '../theme/colors.dart';
 import '../widgets/market/market_category_chips.dart';
 import '../widgets/market/market_resource_strip.dart';
 import 'market/crops_category_page.dart';
 import 'market/decorations_category_page.dart';
 import 'market/fertilizers_category_page.dart';
+import 'market/satchel_page.dart';
 import 'market/skins_category_page.dart';
 
-// Root Market scaffold. Five-cell PageView synchronised with a chip
-// row above. Owns the affordable-only filter and the active page
-// index; everything else is derived from streams.
+// Root Market scaffold. Five-cell PageView synced with an iconified
+// chip row above. Satchel sits leftmost so swiping left from Crops
+// "opens the bag" — the videogame gesture. The buy pages still load
+// by default (index 1 = Crops) so first-run lands on shopping, not
+// an empty inventory.
+//
+// Owns the affordable-only filter and the active page index;
+// everything else is derived from streams.
 
 class MarketScreen extends StatefulWidget {
   const MarketScreen({super.key});
@@ -24,15 +31,29 @@ class MarketScreen extends StatefulWidget {
 }
 
 class _MarketScreenState extends State<MarketScreen> {
-  static const _labels = <String>[
-    'Crops',
-    'Fertilizers',
-    'Decorations',
-    'Skins',
+  // Satchel sits at index 0 (leftmost) so the swipe-left-from-Crops
+  // gesture opens the inventory. The remaining chips keep their prior
+  // order so muscle memory survives. Only the buy-page indices are
+  // named here — nothing jumps to the satchel programmatically.
+  static const _cropsIndex = 1;
+  static const _fertilizersIndex = 2;
+  static const _decorationsIndex = 3;
+  static const _skinsIndex = 4;
+
+  static const _chips = <MarketCategoryChipItem>[
+    MarketCategoryChipItem(label: 'Satchel', icon: Icons.backpack_outlined),
+    MarketCategoryChipItem(label: 'Crops', icon: Icons.eco_outlined),
+    MarketCategoryChipItem(
+        label: 'Fertilizers', icon: Icons.water_drop_outlined),
+    MarketCategoryChipItem(
+        label: 'Decorations', icon: Icons.auto_awesome_outlined),
+    MarketCategoryChipItem(label: 'Skins', icon: Icons.face_outlined),
   ];
 
-  final PageController _pageController = PageController();
-  int _index = 0;
+  // First-run lands on Crops, not the (likely empty) Satchel.
+  final PageController _pageController =
+      PageController(initialPage: _cropsIndex);
+  int _index = _cropsIndex;
   bool _affordableOnly = false;
 
   @override
@@ -49,6 +70,26 @@ class _MarketScreenState extends State<MarketScreen> {
       duration: const Duration(milliseconds: 240),
       curve: Curves.easeOut,
     );
+  }
+
+  // Called from the Satchel's per-section "Shop ›" link. Avatars
+  // live behind the Skins chip — plot/well/barn skins aren't shop
+  // categories yet, so they fall back to the leftmost buy page.
+  void _shopForType(OwnedItemType type) {
+    switch (type) {
+      case OwnedItemType.crop:
+        _selectIndex(_cropsIndex);
+      case OwnedItemType.fertilizer:
+        _selectIndex(_fertilizersIndex);
+      case OwnedItemType.decoration:
+        _selectIndex(_decorationsIndex);
+      case OwnedItemType.avatar:
+        _selectIndex(_skinsIndex);
+      case OwnedItemType.plotColor:
+      case OwnedItemType.wellSkin:
+      case OwnedItemType.barnSkin:
+        _selectIndex(_cropsIndex);
+    }
   }
 
   @override
@@ -73,35 +114,42 @@ class _MarketScreenState extends State<MarketScreen> {
                   onAffordableToggled: (v) =>
                       setState(() => _affordableOnly = v),
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 10),
                 MarketCategoryChips(
-                  labels: _labels,
+                  items: _chips,
                   activeIndex: _index,
                   onSelected: _selectIndex,
                 ),
-                const SizedBox(height: 8),
-                MarketPageDots(index: _index, count: _labels.length),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 Expanded(
                   child: PageView(
                     controller: _pageController,
                     onPageChanged: (i) => setState(() => _index = i),
                     children: [
+                      // _satchelIndex
+                      SatchelPage(
+                        ownedQuantities: ownedQuantities,
+                        onShopForType: _shopForType,
+                      ),
+                      // _cropsIndex
                       CropsCategoryPage(
                         coinBalance: balance,
                         ownedQuantities: ownedQuantities,
                         affordableOnly: _affordableOnly,
                       ),
+                      // _fertilizersIndex
                       FertilizersCategoryPage(
                         coinBalance: balance,
                         ownedQuantities: ownedQuantities,
                         affordableOnly: _affordableOnly,
                       ),
+                      // _decorationsIndex
                       DecorationsCategoryPage(
                         coinBalance: balance,
                         ownedQuantities: ownedQuantities,
                         affordableOnly: _affordableOnly,
                       ),
+                      // _skinsIndex
                       SkinsCategoryPage(
                         coinBalance: balance,
                         ownedQuantities: ownedQuantities,

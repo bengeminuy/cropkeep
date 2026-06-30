@@ -1,6 +1,7 @@
 import 'package:drift/drift.dart';
 
 import '../database.dart';
+import '../tables/wells.dart' show WellType;
 
 class IncomeEntryRepository {
   IncomeEntryRepository(this._db);
@@ -106,6 +107,24 @@ class IncomeEntryRepository {
     return query.watchSingle().map((row) => row.read(sum) ?? 0);
   }
 
+  // wellId → logged base minor for every well with at least one
+  // non-deleted income entry this cycle. Wells with zero entries are
+  // absent from the map (caller treats missing as 0).
+  Stream<Map<int, int>> watchLoggedByWellAndCycle(int cycleId) {
+    final sum = _db.incomeEntries.baseAmount.sum();
+    final query = _db.selectOnly(_db.incomeEntries)
+      ..addColumns([_db.incomeEntries.wellId, sum])
+      ..where(_db.incomeEntries.cycleId.equals(cycleId) &
+          _db.incomeEntries.deletedAt.isNull())
+      ..groupBy([_db.incomeEntries.wellId]);
+    return query.watch().map((rows) {
+      return {
+        for (final row in rows)
+          row.read(_db.incomeEntries.wellId)!: row.read(sum) ?? 0,
+      };
+    });
+  }
+
   Stream<List<IncomeEntryRow>> watchRecentlyDeleted({
     Duration window = const Duration(days: 30),
   }) {
@@ -114,5 +133,23 @@ class IncomeEntryRepository {
           ..where((t) => t.deletedAt.isNotNull() & t.deletedAt.isBiggerThanValue(cutoff))
           ..orderBy([(t) => OrderingTerm.desc(t.deletedAt)]))
         .watch();
+  }
+
+  // Sum of every bonus income entry's base_amount this cycle. Reservoir
+  // math on the Wells subpage's bonus headline reads this against the
+  // bonus allocation total to know what's actually "free" in the pool.
+  Stream<int> watchBonusLoggedMinor(int cycleId) {
+    final sum = _db.incomeEntries.baseAmount.sum();
+    final joined = _db.selectOnly(_db.incomeEntries).join([
+      innerJoin(
+        _db.wells,
+        _db.wells.id.equalsExp(_db.incomeEntries.wellId),
+      ),
+    ])
+      ..addColumns([sum])
+      ..where(_db.incomeEntries.cycleId.equals(cycleId) &
+          _db.incomeEntries.deletedAt.isNull() &
+          _db.wells.wellType.equalsValue(WellType.bonus));
+    return joined.watchSingle().map((row) => row.read(sum) ?? 0);
   }
 }

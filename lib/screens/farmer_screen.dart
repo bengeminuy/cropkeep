@@ -1,17 +1,20 @@
 import 'package:drift/drift.dart' hide Column;
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../app_scope.dart';
 import '../data/currency_catalog.dart';
 import '../data/database.dart';
-import '../data/dev/dummy_data_seeder.dart';
+import '../data/repositories/cycle_repository.dart';
 import '../data/tables/cycle_summaries.dart';
 import '../data/tables/plot_cycle_results.dart';
-import '../data/xp_curve.dart';
+import '../services/data_export_service.dart';
 import '../theme/colors.dart';
 import '../theme/plot_swatches.dart';
 import '../widgets/avatar_picker_sheet.dart';
+import '../widgets/cropkeep_toast.dart';
+import '../widgets/cycle_rates_sheet.dart';
 import '../widgets/secondary_currency_picker_sheet.dart';
 
 class FarmerScreen extends StatelessWidget {
@@ -42,8 +45,8 @@ class FarmerScreen extends StatelessWidget {
                   _HarvestHistorySection(
                     baseCurrencyCode: settings?.baseCurrencyCode,
                   ),
-                  const SizedBox(height: 20),
-                  const _BadgesSection(),
+                  // Dev tools section hidden for now — re-mount
+                  // `_DevToolsSection` here when testing shortcuts are needed.
                   const SizedBox(height: 20),
                   _SettingsSection(settings: settings),
                 ],
@@ -64,59 +67,32 @@ class _ProfileSection extends StatelessWidget {
 
   final AppSettingsRow? settings;
 
-  static const double _ringSize = 132;
   static const double _avatarSize = 104;
 
   @override
   Widget build(BuildContext context) {
     final String avatarId = settings?.avatarId ?? 'farmer';
     final String name = settings?.farmerName ?? 'Farmer';
-    final int level = settings?.farmerLevel ?? 1;
-    final int xp = settings?.farmerXp ?? 0;
-    final double progress = XpCurve.progress(totalXp: xp, level: level);
-    final String title = XpCurve.titleFor(level);
 
     return Column(
       children: [
-        SizedBox(
-          width: _ringSize,
-          height: _ringSize,
-          child: Stack(
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => _openAvatarPicker(context, avatarId),
+          child: Container(
+            width: _avatarSize,
+            height: _avatarSize,
+            decoration: const BoxDecoration(
+              color: CropkeepColors.greenHint,
+              shape: BoxShape.circle,
+            ),
             alignment: Alignment.center,
-            children: [
-              SizedBox(
-                width: _ringSize,
-                height: _ringSize,
-                child: CircularProgressIndicator(
-                  value: progress.clamp(0.0, 1.0),
-                  strokeWidth: 6,
-                  strokeCap: StrokeCap.round,
-                  backgroundColor: CropkeepColors.greenHint,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                    CropkeepColors.greenPrimary,
-                  ),
-                ),
-              ),
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => _openAvatarPicker(context, avatarId),
-                child: Container(
-                  width: _avatarSize,
-                  height: _avatarSize,
-                  decoration: const BoxDecoration(
-                    color: CropkeepColors.greenHint,
-                    shape: BoxShape.circle,
-                  ),
-                  alignment: Alignment.center,
-                  child: SvgPicture.asset(
-                    AvatarPickerSheet.assetFor(avatarId),
-                    width: 76,
-                    height: 76,
-                    fit: BoxFit.contain,
-                  ),
-                ),
-              ),
-            ],
+            child: SvgPicture.asset(
+              AvatarPickerSheet.assetFor(avatarId),
+              width: 76,
+              height: 76,
+              fit: BoxFit.contain,
+            ),
           ),
         ),
         const SizedBox(height: 14),
@@ -129,39 +105,6 @@ class _ProfileSection extends StatelessWidget {
             color: CropkeepColors.textPrimary,
             height: 1.1,
           ),
-        ),
-        const SizedBox(height: 4),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              'Level $level',
-              style: const TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
-                color: CropkeepColors.textPrimary,
-              ),
-            ),
-            const Text(
-              '  ·  ',
-              style: TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
-                color: CropkeepColors.textSecondary,
-              ),
-            ),
-            Text(
-              title,
-              style: const TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: CropkeepColors.textGreen,
-              ),
-            ),
-          ],
         ),
       ],
     );
@@ -1013,10 +956,25 @@ String _formatSurplus(int amount, String symbol, int decimals) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Badges section.
+// Dev tools — temporary testing shortcuts. Remove before shipping.
+//
+// • Grant coins: calls AppSettingsRepository.grantCoinsForTesting,
+//   which bumps `app_settings.coins_balance` and writes a matching
+//   `manualAdjustment` coin_ledger row in one transaction. Mirrors the
+//   production write path so the ledger stays the source of truth.
+// • Advance cycle: backdates the active cycle's start/end into the
+//   previous calendar month via CycleRepository.forceCycleExpiredFor
+//   Testing. The Farm tab's _CycleStatusStrip detects past-end on its
+//   next stream emission and surfaces the "Cycle ended" banner — from
+//   there the user walks through the natural close UX (reconciliation,
+//   exchange rates, surplus split). When no active cycle exists yet,
+//   kicks off the very first one instead.
 
-class _BadgesSection extends StatelessWidget {
-  const _BadgesSection();
+// ignore: unused_element
+class _DevToolsSection extends StatelessWidget {
+  const _DevToolsSection();
+
+  static const int _grantAmount = 1000;
 
   @override
   Widget build(BuildContext context) {
@@ -1024,38 +982,122 @@ class _BadgesSection extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _SectionHeader('Badges'),
-          const SizedBox(height: 8),
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 24),
-            child: Center(
-              child: Column(
-                children: [
-                  Opacity(
-                    opacity: 0.5,
-                    child: SvgPicture.asset(
-                      'assets/icons/coin.svg',
-                      width: 48,
-                      height: 48,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'Earn badges by completing cycles and hitting milestones.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontFamily: 'Nunito',
-                      fontSize: 13,
-                      fontWeight: FontWeight.w400,
-                      color: CropkeepColors.textSecondary,
-                      height: 1.4,
-                    ),
-                  ),
-                ],
-              ),
+          const _SectionHeader('Dev tools'),
+          const SizedBox(height: 6),
+          const Text(
+            'Temporary shortcuts for testing. Removed before shipping.',
+            style: TextStyle(
+              fontFamily: 'Nunito',
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+              color: CropkeepColors.textSecondary,
+              height: 1.3,
             ),
           ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: _DevButton(
+                  label: '+$_grantAmount coins',
+                  icon: Icons.monetization_on_outlined,
+                  onPressed: () => _grantCoins(context),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _DevButton(
+                  label: 'Advance cycle',
+                  icon: Icons.fast_forward_rounded,
+                  onPressed: () => _advanceCycle(context),
+                ),
+              ),
+            ],
+          ),
         ],
+      ),
+    );
+  }
+
+  Future<void> _grantCoins(BuildContext context) async {
+    final repo = AppScope.of(context).appSettings;
+    await repo.grantCoinsForTesting(_grantAmount);
+    if (!context.mounted) return;
+    CropkeepToast.success(
+      context,
+      title: '+$_grantAmount coins',
+      flavor: 'Granted via Dev tools.',
+    );
+  }
+
+  Future<void> _advanceCycle(BuildContext context) async {
+    final scope = AppScope.of(context);
+    final active = await scope.cycles.watchActiveCycle().first;
+    if (active == null) {
+      // No active cycle — bootstrap the first one with the standard
+      // calendar-month range so the rest of the app comes alive without
+      // having to walk through onboarding's begin-tracking step.
+      final range = CycleRepository.proposedNextCycleRange();
+      await scope.cycles.startFirstCycle(
+        startDate: range.start,
+        endDate: range.end,
+      );
+      if (!context.mounted) return;
+      CropkeepToast.success(
+        context,
+        title: 'First cycle started',
+        flavor: 'Dev tool: kicked off cycle 1.',
+      );
+      return;
+    }
+    await scope.cycles.forceCycleExpiredForTesting();
+    if (!context.mounted) return;
+    CropkeepToast.info(
+      context,
+      title: 'Cycle marked as ended',
+      flavor: 'Open the Farm tab to close it via the normal flow.',
+    );
+  }
+}
+
+class _DevButton extends StatelessWidget {
+  const _DevButton({
+    required this.label,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  final String label;
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 44,
+      child: ElevatedButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon, size: 18),
+        label: Text(label),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: CropkeepColors.greenHint,
+          foregroundColor: CropkeepColors.textGreen,
+          elevation: 0,
+          shadowColor: Colors.transparent,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(
+              color: CropkeepColors.greenLight,
+              width: 1,
+            ),
+          ),
+          textStyle: const TextStyle(
+            fontFamily: 'Nunito',
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
       ),
     );
   }
@@ -1096,33 +1138,28 @@ class _SettingsSection extends StatelessWidget {
               );
             },
           ),
-          StreamBuilder<bool>(
-            stream: DummyDataSeeder.watchHasDemo(
-              AppScope.of(context).database,
-            ),
-            builder: (context, snap) {
-              final loaded = snap.data ?? false;
-              return _SettingsRow(
-                label: loaded ? 'Clear demo data' : 'Load demo data',
-                trailingChevron: true,
-                onTap: () => _toggleDemoData(context, loaded),
-              );
-            },
+          _SettingsRow(
+            label: 'Exchange rates',
+            trailingChevron: true,
+            onTap: () => _openRatesSheet(context),
           ),
           _SettingsRow(
             label: 'Reset',
             trailingChevron: true,
             onTap: () => _confirmReset(context),
           ),
-          _SettingsRow(
-            label: 'Export data',
-            trailingChevron: true,
-            onTap: () => _comingSoon(context, 'Data export is coming soon.'),
-          ),
+          // TODO(export-data): re-enable when the export flow is ready to
+          // ship — the row, _exportData(), and DataExportService are wired
+          // and only need this _SettingsRow uncommented to come back.
+          // _SettingsRow(
+          //   label: 'Export data',
+          //   trailingChevron: true,
+          //   onTap: () => _exportData(context),
+          // ),
           // TODO(app-version): read from package_info_plus once available.
           const _SettingsRow(
             label: 'Version',
-            valueText: '0.1.0',
+            valueText: _appVersion,
             isLast: true,
           ),
         ],
@@ -1130,42 +1167,36 @@ class _SettingsSection extends StatelessWidget {
     );
   }
 
-  void _comingSoon(BuildContext context, String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          message,
-          style: const TextStyle(fontFamily: 'Nunito', fontWeight: FontWeight.w600),
-        ),
-        duration: const Duration(seconds: 2),
-      ),
-    );
-  }
+  // Single source for the app version label and the export envelope.
+  // Replace with package_info_plus once that dep lands.
+  static const String _appVersion = '0.1.0';
 
-  Future<void> _toggleDemoData(BuildContext context, bool loaded) async {
-    final db = AppScope.of(context).database;
-    final messenger = ScaffoldMessenger.of(context);
-    if (loaded) {
-      await DummyDataSeeder.clearDummyData(db);
-      messenger.showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Demo data cleared.',
-            style: TextStyle(fontFamily: 'Nunito', fontWeight: FontWeight.w600),
-          ),
-          duration: Duration(seconds: 2),
-        ),
+  // ignore: unused_element
+  Future<void> _exportData(BuildContext context) async {
+    final scope = AppScope.of(context);
+    final renderBox = context.findRenderObject() as RenderBox?;
+    final sharePositionOrigin = renderBox == null
+        ? null
+        : renderBox.localToGlobal(Offset.zero) & renderBox.size;
+    try {
+      final service = DataExportService(scope.database);
+      final file = await service.exportToTempFile(
+        farmerName: settings?.farmerName ?? '',
+        appVersion: _appVersion,
       );
-    } else {
-      await DummyDataSeeder.seedFarmerScreen(db);
-      messenger.showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Demo data loaded.',
-            style: TextStyle(fontFamily: 'Nunito', fontWeight: FontWeight.w600),
-          ),
-          duration: Duration(seconds: 2),
-        ),
+      if (!context.mounted) return;
+      await Share.shareXFiles(
+        [XFile(file.path, mimeType: 'application/json')],
+        subject: 'Cropkeep backup',
+        sharePositionOrigin: sharePositionOrigin,
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      CropkeepToast.error(
+        context,
+        title: 'Export failed',
+        flavor: e.toString(),
+        duration: const Duration(seconds: 3),
       );
     }
   }
@@ -1194,6 +1225,16 @@ class _SettingsSection extends StatelessWidget {
       builder: (_) => const SecondaryCurrencyPickerSheet(),
     );
   }
+
+  Future<void> _openRatesSheet(BuildContext context) {
+    return showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => const CycleRatesSheet(),
+    );
+  }
+
 
   Future<void> _confirmReset(BuildContext context) async {
     final repo = AppScope.of(context).appSettings;
@@ -1257,7 +1298,7 @@ class _ResetConfirmDialog extends StatelessWidget {
             ),
             const SizedBox(height: 10),
             const Text(
-              'Everything you\'ve logged will be removed — wells, plots, harvests, coins, badges. You\'ll start over from the welcome screen. This can\'t be undone.',
+              'Everything you\'ve logged will be removed — wells, plots, harvests, coins. You\'ll start over from the welcome screen. This can\'t be undone.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontFamily: 'Nunito',

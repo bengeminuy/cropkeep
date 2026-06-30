@@ -20,20 +20,12 @@ class CropTierSpec {
     required this.priceCoins,
     required this.seedPackSize,
     required this.yieldPerSeed,
-    required this.packMax,
-    required this.breakEvenLabel,
   });
 
   final CropTier tier;
   final int priceCoins;
   final int seedPackSize;
   final int yieldPerSeed;
-  // Inventory ceiling per shop.md. Owned quantity will not exceed this
-  // once we wire the cap into MarketRepository.purchase.
-  final int packMax;
-  // Human-readable break-even ("3 of 5", "~4.4 of 5"). Renders inside
-  // the tier header so the user reasons about the bet up front.
-  final String breakEvenLabel;
 }
 
 class CropSetSpec {
@@ -79,7 +71,6 @@ class MarketItemSpec {
     required this.priceCoins,
     required this.description,
     required this.iconAsset,
-    this.payback,
   });
 
   final String itemId;
@@ -89,26 +80,6 @@ class MarketItemSpec {
   // Renders verbatim under the name. Keep terse — graphics.md voice.
   final String description;
   final String iconAsset;
-  // Decorations only — rough cycles-to-payback note from shop.md.
-  final String? payback;
-}
-
-// Plot color tile — no icon, just a swatch hex.
-class PlotColorSpec {
-  const PlotColorSpec({
-    required this.itemId,
-    required this.name,
-    required this.priceCoins,
-    required this.swatchHex,
-    this.description,
-  });
-
-  final String itemId;
-  final String name;
-  final int priceCoins;
-  final int swatchHex;
-  // Null for pure cosmetics; populated for the two effect colors.
-  final String? description;
 }
 
 class MarketCatalog {
@@ -122,24 +93,18 @@ class MarketCatalog {
       priceCoins: 75,
       seedPackSize: 5,
       yieldPerSeed: 25,
-      packMax: 125,
-      breakEvenLabel: '3 of 5 to break even',
     ),
     CropTier.uncommon: CropTierSpec(
       tier: CropTier.uncommon,
       priceCoins: 175,
       seedPackSize: 5,
       yieldPerSeed: 40,
-      packMax: 200,
-      breakEvenLabel: '~4.4 of 5 to break even',
     ),
     CropTier.rare: CropTierSpec(
       tier: CropTier.rare,
       priceCoins: 300,
       seedPackSize: 5,
       yieldPerSeed: 75,
-      packMax: 375,
-      breakEvenLabel: '4 of 5 to break even',
     ),
   };
 
@@ -328,7 +293,7 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Fertilizer Mix',
       priceCoins: 20,
-      description: '+15% coin yield on harvest',
+      description: 'Applied plot yields +15% coins at harvest.',
       iconAsset: 'assets/icons/fertilizers/fertilizer.svg',
     ),
     MarketItemSpec(
@@ -336,7 +301,7 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Compost Heap',
       priceCoins: 30,
-      description: '+25% coin yield on harvest',
+      description: 'Applied plot yields +25% coins at harvest.',
       iconAsset: 'assets/icons/fertilizers/compost-heap.svg',
     ),
     MarketItemSpec(
@@ -344,7 +309,7 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Liquid Boost',
       priceCoins: 45,
-      description: '+35% coin yield on harvest',
+      description: 'Applied plot yields +35% coins at harvest.',
       iconAsset: 'assets/icons/fertilizers/liquid-fertilizer.svg',
     ),
     MarketItemSpec(
@@ -352,7 +317,7 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Pumpkin Bloom',
       priceCoins: 60,
-      description: '+50% coin yield on harvest',
+      description: 'Applied plot yields +50% coins at harvest.',
       iconAsset: 'assets/icons/fertilizers/pumpkin.svg',
     ),
     MarketItemSpec(
@@ -360,7 +325,9 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Storm Umbrella',
       priceCoins: 80,
-      description: 'Mild stress treated as harvested for that plot',
+      description:
+          'If the applied plot ends mildly stressed, it still pays the full '
+          'healthy-harvest amount.',
       iconAsset: 'assets/icons/fertilizers/umbrella.svg',
     ),
     MarketItemSpec(
@@ -368,7 +335,9 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Buzzing Beehive',
       priceCoins: 90,
-      description: 'All plots get +10% yield this cycle',
+      description:
+          'Applied plot yields +25% coins and is stress-proof — any final '
+          'state pays as if it harvested healthy.',
       iconAsset: 'assets/icons/fertilizers/beehive.svg',
     ),
     MarketItemSpec(
@@ -376,7 +345,9 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Faerie Reviver',
       priceCoins: 120,
-      description: 'Withered → mild stress (recovers 50% yield)',
+      description:
+          'If the applied plot ends withered, it pays half yield instead of '
+          'nothing.',
       iconAsset: 'assets/icons/fertilizers/fairy.svg',
     ),
     MarketItemSpec(
@@ -384,7 +355,9 @@ class MarketCatalog {
       itemType: OwnedItemType.fertilizer,
       name: 'Mystic Potion',
       priceCoins: 200,
-      description: '+100% yield, but yields 0 if not harvested',
+      description:
+          'Doubles the applied plot\'s yield if it harvests healthy. Pays '
+          'zero if anything goes wrong.',
       iconAsset: 'assets/icons/fertilizers/mana.svg',
     ),
   ];
@@ -396,54 +369,54 @@ class MarketCatalog {
       itemType: OwnedItemType.decoration,
       name: 'Mushroom Gnome',
       priceCoins: 200,
-      description: '+5 coins per cycle if overall positive',
+      description:
+          'Each cycle you finish net-positive, you earn an extra 5 coins.',
       iconAsset: 'assets/icons/decorations/mushroom.svg',
-      payback: '~40 cycles · flavor buy',
     ),
     MarketItemSpec(
       itemId: 'iron_pitchfork',
       itemType: OwnedItemType.decoration,
       name: 'Iron Pitchfork',
       priceCoins: 350,
-      description: 'Withered plots no longer break the combo bonus',
+      description:
+          'A withered plot no longer disqualifies you from the end-of-cycle '
+          'all-plots-healthy bonus.',
       iconAsset: 'assets/icons/decorations/pitchfork.svg',
-      payback: 'situational',
     ),
     MarketItemSpec(
       itemId: 'stone_fountain',
       itemType: OwnedItemType.decoration,
       name: 'Stone Fountain',
       priceCoins: 500,
-      description: '+1 coin per healthy harvest, per plot, per cycle',
+      description:
+          'Every plot that harvests healthy pays +1 extra coin each cycle.',
       iconAsset: 'assets/icons/decorations/fountain.svg',
-      payback: '~20 cycles for a 5-plot player',
     ),
     MarketItemSpec(
       itemId: 'wishing_windmill',
       itemType: OwnedItemType.decoration,
       name: 'Wishing Windmill',
       priceCoins: 700,
-      description: 'Unplanned bonus pays 25c when harvested (was 15)',
+      description:
+          'When your Unplanned plot ends healthy, it pays 25 coins instead '
+          'of the usual 15.',
       iconAsset: 'assets/icons/decorations/windmill.svg',
-      payback: '~70 cycles · status',
     ),
     MarketItemSpec(
       itemId: 'potted_heirloom',
       itemType: OwnedItemType.decoration,
       name: 'Potted Heirloom',
       priceCoins: 900,
-      description: 'All fertilizer prices −20%',
+      description: 'Every fertilizer in the Market is 20% cheaper.',
       iconAsset: 'assets/icons/decorations/potted-plant.svg',
-      payback: '~10 cycles if you fertilize heavily',
     ),
     MarketItemSpec(
       itemId: 'eternal_sun',
       itemType: OwnedItemType.decoration,
       name: 'Eternal Sun',
       priceCoins: 1500,
-      description: '+10% to all healthy harvest coin yields, permanent',
+      description: 'Every healthy harvest pays 10% more coins, forever.',
       iconAsset: 'assets/icons/decorations/sun.svg',
-      payback: '~50 cycles · prestige',
     ),
     MarketItemSpec(
       itemId: 'crystal_aquifer',
@@ -451,21 +424,14 @@ class MarketCatalog {
       name: 'Crystal Aquifer',
       priceCoins: 1800,
       description:
-          'Carryover well lifts next cycle\'s overall result one tier '
-          'if rollover ≥10% of income',
+          'If you roll over 10% or more of your income at cycle close, next '
+          'cycle\'s overall tier is bumped up by one.',
       iconAsset: 'assets/icons/decorations/crystal.svg',
-      payback: '~60 cycles for big savers',
     ),
-    MarketItemSpec(
-      itemId: 'treasure_vault',
-      itemType: OwnedItemType.decoration,
-      name: 'Treasure Vault',
-      priceCoins: 2000,
-      description:
-          'Barn balance earns +1c per 100c stored each cycle, cap +20',
-      iconAsset: 'assets/icons/decorations/safe.svg',
-      payback: 'scales with barn size · top-tier prestige',
-    ),
+    // The 2000c prestige slot is intentionally vacant — see
+    // [md/shop.md](../../../md/shop.md) §3 and to-do.md. The previous
+    // Treasure Vault design tied payout to barn balance, which scales
+    // wildly across base currencies.
   ];
 
   // ──────── Avatars (one-time, cosmetic + some passives) ────────
@@ -477,7 +443,7 @@ class MarketCatalog {
       itemType: OwnedItemType.avatar,
       name: 'Default Farmer',
       priceCoins: 0,
-      description: 'Cosmetic',
+      description: 'Cosmetic. Your starting look.',
       iconAsset: 'assets/icons/farmer.svg',
     ),
     MarketItemSpec(
@@ -485,7 +451,7 @@ class MarketCatalog {
       itemType: OwnedItemType.avatar,
       name: 'Pirate Sailor',
       priceCoins: 150,
-      description: 'Cosmetic',
+      description: 'Cosmetic. No gameplay effect.',
       iconAsset: 'assets/icons/avatars/pirate.svg',
     ),
     MarketItemSpec(
@@ -493,7 +459,7 @@ class MarketCatalog {
       itemType: OwnedItemType.avatar,
       name: 'Beekeeper',
       priceCoins: 600,
-      description: 'Set bonus payouts +25% while equipped',
+      description: 'Cosmetic. A rare keeper of the apiary.',
       iconAsset: 'assets/icons/avatars/beekeeper.svg',
     ),
     MarketItemSpec(
@@ -501,7 +467,7 @@ class MarketCatalog {
       itemType: OwnedItemType.avatar,
       name: 'Forest Elf',
       priceCoins: 1200,
-      description: '+5% yield to all plots while equipped',
+      description: 'While equipped, every plot on your farm yields +5%.',
       iconAsset: 'assets/icons/avatars/legolas.svg',
     ),
     MarketItemSpec(
@@ -510,62 +476,9 @@ class MarketCatalog {
       name: 'Arcane Wizard',
       priceCoins: 2500,
       description:
-          '+10% yield, mild stress counts as harvested for combo bonus',
+          'While equipped: every plot yields +10%, and mildly stressed plots '
+          'count as healthy when scoring the all-plots-healthy bonus.',
       iconAsset: 'assets/icons/avatars/gandalf.svg',
-    ),
-  ];
-
-  // ──────── Plot colors (one-time, per-plot swatch) ────────
-  static const List<PlotColorSpec> plotColors = <PlotColorSpec>[
-    PlotColorSpec(
-      itemId: 'plot_soil',
-      name: 'Soil brown',
-      priceCoins: 0,
-      swatchHex: 0xFF8B5E3C,
-    ),
-    PlotColorSpec(
-      itemId: 'plot_loam',
-      name: 'Loam',
-      priceCoins: 50,
-      swatchHex: 0xFFD2B48C,
-    ),
-    PlotColorSpec(
-      itemId: 'plot_clay',
-      name: 'Clay',
-      priceCoins: 50,
-      swatchHex: 0xFFB87333,
-    ),
-    PlotColorSpec(
-      itemId: 'plot_ash',
-      name: 'Ash',
-      priceCoins: 50,
-      swatchHex: 0xFFB2BEB5,
-    ),
-    PlotColorSpec(
-      itemId: 'plot_moss',
-      name: 'Moss',
-      priceCoins: 50,
-      swatchHex: 0xFF6E8B3D,
-    ),
-    PlotColorSpec(
-      itemId: 'plot_snow',
-      name: 'Snow',
-      priceCoins: 50,
-      swatchHex: 0xFFE8EEF4,
-    ),
-    PlotColorSpec(
-      itemId: 'plot_obsidian',
-      name: 'Obsidian black',
-      priceCoins: 500,
-      swatchHex: 0xFF1A1A1A,
-      description: 'Chosen plot gets +15% yield (re-assignable)',
-    ),
-    PlotColorSpec(
-      itemId: 'plot_volcanic',
-      name: 'Volcanic red',
-      priceCoins: 1500,
-      swatchHex: 0xFFC84040,
-      description: 'Chosen plot: withered treated as mild stress',
     ),
   ];
 

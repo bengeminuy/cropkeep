@@ -111,6 +111,24 @@ class TransactionRepository {
     return query.watchSingle().map((row) => row.read(sum) ?? 0);
   }
 
+  // plotId → spent base minor for every plot with at least one
+  // non-deleted transaction this cycle. Plots with zero transactions
+  // are absent from the map (the caller should treat missing as 0).
+  Stream<Map<int, int>> watchPlotSpentByCycle(int cycleId) {
+    final sum = _db.transactions.baseAmount.sum();
+    final query = _db.selectOnly(_db.transactions)
+      ..addColumns([_db.transactions.plotId, sum])
+      ..where(_db.transactions.cycleId.equals(cycleId) &
+          _db.transactions.deletedAt.isNull())
+      ..groupBy([_db.transactions.plotId]);
+    return query.watch().map((rows) {
+      return {
+        for (final row in rows)
+          row.read(_db.transactions.plotId)!: row.read(sum) ?? 0,
+      };
+    });
+  }
+
   Stream<List<TransactionRow>> watchRecentlyDeleted({
     Duration window = const Duration(days: 30),
   }) {

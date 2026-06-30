@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
 
+import 'package:flutter_svg/flutter_svg.dart';
+
 import '../../app_scope.dart';
 import '../../data/database.dart';
 import '../../theme/colors.dart';
+import '../../widgets/apply_fertilizer_sheet.dart';
 import '../../widgets/breakdown_envelope_header.dart';
+import '../market/market_catalog.dart';
 import 'general_spending_breakdown_screen.dart' show BreakdownPlotKind;
+import 'new_plot_screen.dart';
 
 // ──────────────────────────────────────────────────────────────────────────
 // PlotBreakdownScreen — per-plot drill-down pushed from a row on the Crops
@@ -47,6 +52,7 @@ class PlotBreakdownTransaction {
 
 class PlotBreakdownData {
   const PlotBreakdownData({
+    required this.plotId,
     required this.plotName,
     required this.iconAsset,
     required this.kind,
@@ -55,10 +61,23 @@ class PlotBreakdownData {
     required this.cycleLength,
     required this.cycleStartWeekday,
     required this.transactions,
+    required this.reservoirTotal,
+    required this.allocatedSoFar,
+    required this.cycleId,
     this.totalIncome,
     this.incomeSharePct,
   });
 
+  // Active cycle id — needed so the Apply Fertilizer action sheet can
+  // scope its write to the current cycle (one pack per plot per cycle).
+  // Always set when the breakdown is opened from the Crops subpage,
+  // which only routes to this screen with an active cycle present.
+  final int cycleId;
+
+  // Row id from `plots`. Needed so the overflow menu's Remove action
+  // can call PlotRepository.archive — Unplanned still surfaces an id but
+  // the menu refuses to act on it.
+  final int plotId;
   final String plotName;
   final String iconAsset;
   final BreakdownPlotKind kind;
@@ -73,6 +92,14 @@ class PlotBreakdownData {
   // free of absolute dates while the rows still surface weekday pattern.
   final int cycleStartWeekday;
   final List<PlotBreakdownTransaction> transactions;
+
+  // Cycle reservoir context — carry-throughs from the Crops page so the
+  // Edit-plot flow can reuse NewPlotScreen's allocation bar without
+  // re-fetching plots + rates from this screen. reservoirTotal is the
+  // foundation cap; allocatedSoFar is the sum of all active non-Unplanned
+  // plot budgets converted to base. Both in base minor units.
+  final int reservoirTotal;
+  final int allocatedSoFar;
 
   // Unplanned-only context. The wild patch is measured against total cycle
   // income via the 20% danger threshold rather than a budget cap, so the
@@ -155,7 +182,11 @@ class _Body extends StatelessWidget {
 
     final int spent = data.totalSpent;
     final int? budget = data.budget;
-    final bool isOver = budget != null && spent > budget;
+    // For investment plots the "budget" is a fill-up target, not a ceiling.
+    // Going past the target is virtuous — overage shouldn't paint as a
+    // red over-cap warning, so we don't compute an overrun for investments.
+    final bool isInvestment = data.kind == BreakdownPlotKind.investment;
+    final bool isOver = !isInvestment && budget != null && spent > budget;
     final int overrun = isOver ? spent - budget : 0;
 
     final double progressFraction;
@@ -167,6 +198,15 @@ class _Body extends StatelessWidget {
       progressFraction =
           b <= 0 ? 0.0 : (spent / b).clamp(0.0, 1.0);
     }
+
+    // Unplanned is undeletable per project memory; everything else can
+    // be archived as long as no live transaction was logged against it
+    // this cycle. Soft-deleted transactions don't count — `data.transactions`
+    // is already filtered to deletedAt IS NULL upstream in watchByPlot, so
+    // emptiness here is the exact "no live txns this cycle" signal.
+    final bool canRemove =
+        !data.isUnplanned && data.transactions.isEmpty;
+    final bool showMenu = !data.isUnplanned;
 
     return Scaffold(
       backgroundColor: CropkeepColors.bgScreen,
@@ -181,16 +221,52 @@ class _Body extends StatelessWidget {
             overrunMinor: overrun,
             captionSpans: _buildCaptionSpans(data, symbol, decimals),
             progressFraction: progressFraction,
+            trailing: showMenu
+                ? _PlotOverflowMenu(
+                    plotId: data.plotId,
+                    plotName: data.plotName,
+                    canRemove: canRemove,
+                    reservoirTotal: data.reservoirTotal,
+                    allocatedSoFar: data.allocatedSoFar,
+                    cycleId: data.cycleId,
+                    cycleDay: data.cycleDay,
+                    cycleLength: data.cycleLength,
+                  )
+                : null,
           ),
           Expanded(
             child: SingleChildScrollView(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 28),
-              child: _TransactionsSection(
-                transactionsSorted: txSorted,
-                totalSpent: data.totalSpent,
-                cycleStartWeekday: data.cycleStartWeekday,
-                symbol: symbol,
-                decimals: decimals,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // Fertilizer is a per-cycle modifier the player should
+                  // see and edit at a glance, not bury behind ⋮. Renders
+                  // above the transaction list because it's small and
+                  // sets the harvest plan context before the user dives
+                  // into the spending detail.
+                  //
+                  // Hidden for Unplanned (wild patch isn't fertilizable
+                  // per project memory) and when no active cycle exists
+                  // (nothing to scope the application to).
+                  if (!data.isUnplanned && data.cycleId > 0) ...[
+                    _FertilizerSection(
+                      plotId: data.plotId,
+                      cycleId: data.cycleId,
+                      plotName: data.plotName,
+                      cycleDay: data.cycleDay,
+                      cycleLength: data.cycleLength,
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                  _TransactionsSection(
+                    transactionsSorted: txSorted,
+                    totalSpent: data.totalSpent,
+                    cycleStartWeekday: data.cycleStartWeekday,
+                    symbol: symbol,
+                    decimals: decimals,
+                  ),
+                ],
               ),
             ),
           ),
@@ -230,6 +306,10 @@ List<InlineSpan> _buildCaptionSpans(
       const TextSpan(text: ' of income'),
     ]);
   } else {
+    // Investments fill toward a target instead of spending against a
+    // budget — same number, different word — so the caption reads
+    // "of $X target" for investment plots and "of $X budget" otherwise.
+    final bool isInvestment = data.kind == BreakdownPlotKind.investment;
     spans.addAll([
       const TextSpan(text: 'of '),
       TextSpan(
@@ -239,7 +319,7 @@ List<InlineSpan> _buildCaptionSpans(
           color: CropkeepColors.textPrimary,
         ),
       ),
-      const TextSpan(text: ' budget'),
+      TextSpan(text: isInvestment ? ' target' : ' budget'),
     ]);
   }
   spans.addAll([
@@ -254,6 +334,460 @@ List<InlineSpan> _buildCaptionSpans(
     TextSpan(text: ' of ${data.cycleLength}'),
   ]);
   return spans;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Overflow control — top-right ⋮ on the envelope header. The button itself
+// is a plain glyph tinted to match the back arrow so the two corner
+// affordances read as a pair, not as one custom + one Material control.
+//
+// Tap opens a Cropkeep-styled action sheet rather than the stock
+// PopupMenuButton: a Material popup card collides with the sand/cream
+// palette, and the app already speaks bottom-sheet for every meaningful
+// action (log expense, confirm cycle close, etc.) — using the same
+// vocabulary here keeps the chrome consistent.
+//
+// The blocked-state explanation lives INSIDE the action sheet on the
+// disabled row rather than as a separate "blocked" sheet you reach by
+// tapping a disabled item. One tap, one surface, with the rule visible
+// up front — the user learns why the action is gated without having to
+// poke at it.
+
+class _PlotOverflowMenu extends StatelessWidget {
+  const _PlotOverflowMenu({
+    required this.plotId,
+    required this.plotName,
+    required this.canRemove,
+    required this.reservoirTotal,
+    required this.allocatedSoFar,
+    required this.cycleId,
+    required this.cycleDay,
+    required this.cycleLength,
+  });
+
+  final int plotId;
+  final String plotName;
+  // True iff the plot has no live transactions this cycle. Gates the
+  // destructive Remove action AND the financial fields in Edit (kind,
+  // budget, currency) — same rule, same source of truth.
+  final bool canRemove;
+  // Carry-throughs for the Edit flow: NewPlotScreen needs the cycle's
+  // reservoir context to render its allocation bar.
+  final int reservoirTotal;
+  final int allocatedSoFar;
+  // Cycle context for the Apply fertilizer flow — scopes the write to
+  // the active cycle and supplies the "Day n of N" hint in the sheet.
+  final int cycleId;
+  final int cycleDay;
+  final int cycleLength;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: 'More',
+      onPressed: () => _open(context),
+      icon: const Icon(
+        Icons.more_vert_rounded,
+        size: 26,
+        color: CropkeepColors.textSecondaryOnHero,
+      ),
+    );
+  }
+
+  Future<void> _open(BuildContext context) async {
+    final action = await showModalBottomSheet<_PlotMenuAction>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => _PlotActionSheet(
+        plotName: plotName,
+        canEditFinancials: canRemove,
+      ),
+    );
+    if (action == null) return;
+    switch (action) {
+      case _PlotMenuAction.edit:
+        if (!context.mounted) return;
+        await _openEdit(context);
+      case _PlotMenuAction.remove:
+        if (!context.mounted) return;
+        final confirmed = await _showRemoveConfirmSheet(context, plotName);
+        if (confirmed != true) return;
+        if (!context.mounted) return;
+        await AppScope.of(context).plots.archive(plotId);
+        if (!context.mounted) return;
+        Navigator.of(context).maybePop();
+    }
+  }
+
+  // Fetches the freshest plot row right before opening the editor so the
+  // form hydrates from current values (the breakdown screen was opened
+  // with a snapshot; the row may have been edited from another flow
+  // since). On successful save the breakdown pops too — its snapshot is
+  // now stale, and the Crops list is live-queried so the user lands on
+  // up-to-date data.
+  Future<void> _openEdit(BuildContext context) async {
+    final scope = AppScope.of(context);
+    final PlotRow? row =
+        await scope.plots.watchById(plotId).first;
+    if (row == null || !context.mounted) return;
+    final bool? saved = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => NewPlotScreen(
+          reservoirTotal: reservoirTotal,
+          allocatedSoFar: allocatedSoFar,
+          existingPlot: row,
+          canEditFinancials: canRemove,
+        ),
+      ),
+    );
+    if (saved != true || !context.mounted) return;
+    Navigator.of(context).maybePop();
+  }
+}
+
+enum _PlotMenuAction { edit, remove }
+
+Future<bool?> _showRemoveConfirmSheet(BuildContext context, String name) {
+  return showModalBottomSheet<bool>(
+    context: context,
+    backgroundColor: Colors.transparent,
+    isScrollControlled: true,
+    builder: (_) => _RemovePlotConfirmSheet(plotName: name),
+  );
+}
+
+// Cropkeep-styled action sheet. Shape and chrome mirror
+// LedgerEntryDetailSheet / log_transaction_sheet so the user reads it as
+// "the same kind of surface" the rest of the app uses.
+class _PlotActionSheet extends StatelessWidget {
+  const _PlotActionSheet({
+    required this.plotName,
+    required this.canEditFinancials,
+  });
+
+  final String plotName;
+  // Same gate as Remove (no live transactions this cycle). Edit is always
+  // available — this flag only changes its caption to flag what will be
+  // locked once the editor opens. Remove uses this flag directly as its
+  // enabled state.
+  final bool canEditFinancials;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: CropkeepColors.bgScreen,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: CropkeepColors.borderDivider,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            // Small eyebrow + plot name so the sheet anchors back to which
+            // plot is being acted on (without re-stating the breakdown
+            // hero — that would feel echoey).
+            Text(
+              plotName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 16,
+                fontWeight: FontWeight.w800,
+                color: CropkeepColors.textPrimary,
+                height: 1.2,
+              ),
+            ),
+            const SizedBox(height: 14),
+            _ActionRow(
+              icon: Icons.edit_outlined,
+              label: 'Edit plot',
+              caption: canEditFinancials
+                  ? 'Change the name, budget, kind, crop, color, or due day.'
+                  : 'Change name, crop, color, or due day. Budget and kind '
+                      'stay locked while transactions exist this cycle.',
+              destructive: false,
+              enabled: true,
+              onTap: () =>
+                  Navigator.of(context).pop(_PlotMenuAction.edit),
+            ),
+            const SizedBox(height: 10),
+            _ActionRow(
+              icon: Icons.delete_outline_rounded,
+              label: 'Remove plot',
+              caption: canEditFinancials
+                  ? 'Archived from your Crops list. History stays intact.'
+                  : 'Has transactions this cycle — remove them first or '
+                      'wait until the cycle closes.',
+              destructive: true,
+              enabled: canEditFinancials,
+              onTap: () =>
+                  Navigator.of(context).pop(_PlotMenuAction.remove),
+            ),
+            const SizedBox(height: 14),
+            SizedBox(
+              height: 48,
+              child: TextButton(
+                onPressed: () => Navigator.of(context).maybePop(),
+                style: TextButton.styleFrom(
+                  foregroundColor: CropkeepColors.textPrimary,
+                  textStyle: const TextStyle(
+                    fontFamily: 'Nunito',
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  side: const BorderSide(
+                    color: CropkeepColors.borderCard,
+                    width: 1.5,
+                  ),
+                ),
+                child: const Text('Cancel'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// White card row inside the action sheet — same card grammar as
+// _DetailCard / _SectionCard so an "action you can take" reads as a
+// peer of "info you can look at." Naked leading icon (no tinted-square
+// chiclet) keeps the row light enough to scale to more actions later;
+// color carries the destructive signal so the chrome stays calm. A
+// trailing chevron marks navigable rows ("tap leads to another
+// surface") and is omitted on destructive rows so they read as
+// terminal intent rather than "go somewhere." Disabled state mutes
+// the colors and drops the tap target + the chevron rather than
+// offering a separate blocked sheet — the caption carries the rule.
+class _ActionRow extends StatelessWidget {
+  const _ActionRow({
+    required this.icon,
+    required this.label,
+    required this.caption,
+    required this.destructive,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final String caption;
+  final bool destructive;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color accent = destructive
+        ? CropkeepColors.textRedDeep
+        : CropkeepColors.textPrimary;
+    final Color labelColor =
+        enabled ? accent : CropkeepColors.textSecondary;
+    final Color iconColor =
+        enabled ? accent : CropkeepColors.textSecondary;
+
+    return Material(
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+        side: const BorderSide(
+          color: CropkeepColors.borderCard,
+          width: 1.5,
+        ),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: enabled ? onTap : null,
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Icon(icon, color: iconColor, size: 22),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontFamily: 'Nunito',
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: labelColor,
+                        height: 1.2,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      caption,
+                      style: const TextStyle(
+                        fontFamily: 'Nunito',
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: CropkeepColors.textSecondary,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (enabled && !destructive) ...[
+                const SizedBox(width: 8),
+                const Icon(
+                  Icons.chevron_right_rounded,
+                  size: 18,
+                  color: CropkeepColors.textSecondary,
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RemovePlotConfirmSheet extends StatelessWidget {
+  const _RemovePlotConfirmSheet({required this.plotName});
+
+  final String plotName;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: CropkeepColors.bgScreen,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: CropkeepColors.borderDivider,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Text.rich(
+              TextSpan(
+                style: const TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  color: CropkeepColors.textPrimary,
+                ),
+                children: [
+                  const TextSpan(text: 'Remove '),
+                  TextSpan(
+                    text: plotName,
+                    style: const TextStyle(
+                      color: CropkeepColors.textRedDeep,
+                    ),
+                  ),
+                  const TextSpan(text: '?'),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'It will disappear from your Crops list right away. Past '
+              'cycles will still reference it in their history.',
+              style: TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: CropkeepColors.textSecondary,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 48,
+                    child: TextButton(
+                      onPressed: () => Navigator.of(context).pop(false),
+                      style: TextButton.styleFrom(
+                        foregroundColor: CropkeepColors.textPrimary,
+                        textStyle: const TextStyle(
+                          fontFamily: 'Nunito',
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        side: const BorderSide(
+                          color: CropkeepColors.borderCard,
+                          width: 1.5,
+                        ),
+                      ),
+                      child: const Text('Cancel'),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: SizedBox(
+                    height: 48,
+                    child: FilledButton(
+                      onPressed: () => Navigator.of(context).pop(true),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: CropkeepColors.redAlert,
+                        foregroundColor: Colors.white,
+                        textStyle: const TextStyle(
+                          fontFamily: 'Nunito',
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      child: const Text('Remove'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -555,6 +1089,8 @@ String _kindLabel(BreakdownPlotKind kind) {
       return 'SPENDING PLOT';
     case BreakdownPlotKind.fixedObligation:
       return 'BILL';
+    case BreakdownPlotKind.investment:
+      return 'INVESTMENT PLOT';
     case BreakdownPlotKind.unplanned:
       return 'WILD PATCH · OFF-BUDGET';
   }
@@ -567,6 +1103,453 @@ String _formatSharePct(double pct) {
   if (pct >= 10) return pct.toStringAsFixed(0);
   if (pct <= 0) return '0';
   return pct.toStringAsFixed(1);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Fertilizer section — first-class affordance on the breakdown page.
+//
+// Two visual states share the section card chrome:
+//   • Empty   — leaf glyph + "No fertilizer applied" + brief hint + a
+//               full-width green "Apply fertilizer" button.
+//   • Applied — SVG art + name + effect description + two side-by-side
+//               buttons (Swap, Remove).
+//
+// Lives ABOVE the transactions card. Fertilizer is a per-cycle modifier
+// that sets the harvest plan; transactions are the per-cycle ledger.
+// Surfacing the modifier first orients the reader before they scan
+// the transaction detail.
+//
+// Watches `fertilizers.watchByPlotAndCycle` so apply/remove from the
+// sheet shows up in the section instantly without manual refresh.
+
+class _FertilizerSection extends StatelessWidget {
+  const _FertilizerSection({
+    required this.plotId,
+    required this.cycleId,
+    required this.plotName,
+    required this.cycleDay,
+    required this.cycleLength,
+  });
+
+  final int plotId;
+  final int cycleId;
+  final String plotName;
+  final int cycleDay;
+  final int cycleLength;
+
+  @override
+  Widget build(BuildContext context) {
+    final scope = AppScope.of(context);
+    return StreamBuilder<PlotFertilizerApplicationRow?>(
+      stream: scope.fertilizers
+          .watchByPlotAndCycle(cycleId: cycleId, plotId: plotId),
+      builder: (context, snap) {
+        final row = snap.data;
+        MarketItemSpec? spec;
+        if (row != null) {
+          for (final s in MarketCatalog.fertilizers) {
+            if (s.itemId == row.fertilizerItemId) {
+              spec = s;
+              break;
+            }
+          }
+        }
+        return _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.baseline,
+                textBaseline: TextBaseline.alphabetic,
+                children: [
+                  const _SectionHeader('Fertilizer'),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      spec == null
+                          ? 'Optional · 1 pack per cycle'
+                          : 'Boosting this cycle',
+                      style: const TextStyle(
+                        fontFamily: 'Nunito',
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: CropkeepColors.textSecondary,
+                        height: 1.2,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              if (spec == null)
+                _FertilizerEmptyBody(
+                  onApply: () => _openApplySheet(context),
+                )
+              else
+                _FertilizerAppliedBody(
+                  spec: spec,
+                  onSwap: () => _openApplySheet(context),
+                  onRemove: () => _confirmRemove(context),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _openApplySheet(BuildContext context) async {
+    await showApplyFertilizerSheetLive(
+      context,
+      plotId: plotId,
+      cycleId: cycleId,
+      plotName: plotName,
+      cycleDay: cycleDay,
+      cycleLength: cycleLength,
+    );
+  }
+
+  // Same forfeit-on-remove policy as the sheet's Remove path. Lives
+  // here so the section's Remove button doesn't have to bounce through
+  // the sheet just to access the confirm; consistent confirm copy
+  // ("pack forfeited") keeps the two surfaces in sync.
+  Future<void> _confirmRemove(BuildContext context) async {
+    final confirmed = await showModalBottomSheet<bool>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => const _RemoveFertilizerConfirmSheet(),
+    );
+    if (confirmed != true || !context.mounted) return;
+    final scope = AppScope.of(context);
+    await scope.fertilizers.removeFromPlot(
+      cycleId: cycleId,
+      plotId: plotId,
+    );
+  }
+}
+
+class _FertilizerEmptyBody extends StatelessWidget {
+  const _FertilizerEmptyBody({required this.onApply});
+  final VoidCallback onApply;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: CropkeepColors.bgHero,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: CropkeepColors.borderCard,
+                  width: 1,
+                ),
+              ),
+              alignment: Alignment.center,
+              child: const Icon(
+                Icons.local_florist_outlined,
+                size: 22,
+                color: CropkeepColors.textSecondaryOnHero,
+              ),
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'No fertilizer applied',
+                    style: TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                      color: CropkeepColors.textPrimary,
+                      height: 1.2,
+                    ),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    'Boost yield or rescue a stressed crop. One pack '
+                    'per plot per cycle — no refund on swap.',
+                    style: TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: CropkeepColors.textSecondary,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        SizedBox(
+          height: 44,
+          child: FilledButton.icon(
+            onPressed: onApply,
+            icon: const Icon(Icons.add_rounded, size: 18),
+            label: const Text('Apply fertilizer'),
+            style: FilledButton.styleFrom(
+              backgroundColor: CropkeepColors.greenPrimary,
+              foregroundColor: CropkeepColors.textOnGreenBtn,
+              textStyle: const TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 14,
+                fontWeight: FontWeight.w800,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _FertilizerAppliedBody extends StatelessWidget {
+  const _FertilizerAppliedBody({
+    required this.spec,
+    required this.onSwap,
+    required this.onRemove,
+  });
+
+  final MarketItemSpec spec;
+  final VoidCallback onSwap;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: CropkeepColors.greenHint,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: CropkeepColors.greenPrimary.withValues(alpha: 0.4),
+                  width: 1.5,
+                ),
+              ),
+              alignment: Alignment.center,
+              child: SvgPicture.asset(spec.iconAsset, width: 36, height: 36),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    spec.name,
+                    style: const TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 15,
+                      fontWeight: FontWeight.w800,
+                      color: CropkeepColors.textPrimary,
+                      height: 1.2,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    spec.description,
+                    style: const TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: CropkeepColors.textSecondary,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        Row(
+          children: [
+            Expanded(
+              child: SizedBox(
+                height: 44,
+                child: OutlinedButton.icon(
+                  onPressed: onSwap,
+                  icon: const Icon(Icons.swap_horiz_rounded, size: 18),
+                  label: const Text('Swap'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: CropkeepColors.textPrimary,
+                    side: const BorderSide(
+                      color: CropkeepColors.borderCard,
+                      width: 1.5,
+                    ),
+                    textStyle: const TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: SizedBox(
+                height: 44,
+                child: OutlinedButton.icon(
+                  onPressed: onRemove,
+                  icon: const Icon(Icons.delete_outline_rounded, size: 18),
+                  label: const Text('Remove'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: CropkeepColors.textRedDeep,
+                    side: BorderSide(
+                      color:
+                          CropkeepColors.redAlert.withValues(alpha: 0.45),
+                      width: 1.5,
+                    ),
+                    textStyle: const TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class _RemoveFertilizerConfirmSheet extends StatelessWidget {
+  const _RemoveFertilizerConfirmSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: CropkeepColors.bgScreen,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: CropkeepColors.borderDivider,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              'Remove fertilizer?',
+              style: TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+                color: CropkeepColors.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'The pack is forfeited — no refund. The plot reverts to '
+              'its unboosted yield for this cycle.',
+              style: TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: CropkeepColors.textSecondary,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 48,
+                    child: TextButton(
+                      onPressed: () => Navigator.of(context).pop(false),
+                      style: TextButton.styleFrom(
+                        foregroundColor: CropkeepColors.textPrimary,
+                        textStyle: const TextStyle(
+                          fontFamily: 'Nunito',
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        side: const BorderSide(
+                          color: CropkeepColors.borderCard,
+                          width: 1.5,
+                        ),
+                      ),
+                      child: const Text('Cancel'),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: SizedBox(
+                    height: 48,
+                    child: FilledButton(
+                      onPressed: () => Navigator.of(context).pop(true),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: CropkeepColors.redAlert,
+                        foregroundColor: Colors.white,
+                        textStyle: const TextStyle(
+                          fontFamily: 'Nunito',
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      child: const Text('Remove'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

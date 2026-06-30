@@ -3,6 +3,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../app_scope.dart';
 import '../../data/currency_catalog.dart';
+import '../../services/fx_rates_service.dart';
 import '../../theme/colors.dart';
 import '../../widgets/avatar_picker_sheet.dart';
 import '../../widgets/secondary_currency_picker_sheet.dart';
@@ -24,16 +25,20 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
   static const int _bonusWellsTeach = 5;
   static const int _cropsTeach = 6;
   static const int _marketTeach = 7;
-  static const int _exchangeTeach = 8;
+  static const int _exchangeRates = 8;
   static const int _allSet = 9;
 
   final TextEditingController _nameController = TextEditingController();
-  String _avatarId = 'farmer';
+  final String _avatarId = 'farmer';
   String? _baseCode;
   final Set<String> _secondaryCodes = <String>{};
+  // Storage-form (rate-to-base) for each secondary code; empty until the
+  // user passes through the _exchangeRates step.
+  final Map<String, double> _ratesToBase = <String, double>{};
   int _pageIndex = _welcome;
   bool _submitting = false;
   bool _localeDefaultApplied = false;
+  bool _forward = true;
 
   List<int> get _pageSequence {
     final base = <int>[
@@ -46,7 +51,7 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
       _cropsTeach,
       _marketTeach,
     ];
-    if (_secondaryCodes.isNotEmpty) base.add(_exchangeTeach);
+    if (_secondaryCodes.isNotEmpty) base.add(_exchangeRates);
     base.add(_allSet);
     return base;
   }
@@ -57,18 +62,27 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
   void _goNext() {
     final pos = _pageSequence.indexOf(_pageIndex);
     if (pos < _pageSequence.length - 1) {
-      setState(() => _pageIndex = _pageSequence[pos + 1]);
+      setState(() {
+        _forward = true;
+        _pageIndex = _pageSequence[pos + 1];
+      });
     }
   }
 
   void _goBack() {
     final pos = _pageSequence.indexOf(_pageIndex);
     if (pos > 0) {
-      setState(() => _pageIndex = _pageSequence[pos - 1]);
+      setState(() {
+        _forward = false;
+        _pageIndex = _pageSequence[pos - 1];
+      });
     }
   }
 
-  VoidCallback? get _backCallback => _pageIndex == _welcome ? null : _goBack;
+  VoidCallback? get _backCallback {
+    if (_pageIndex == _welcome || _submitting) return null;
+    return _goBack;
+  }
 
   void _applyLocaleDefault(BuildContext context) {
     if (_localeDefaultApplied) return;
@@ -113,6 +127,7 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
             avatarId: _avatarId,
             baseCode: baseCode,
             secondaryCodes: _secondaryCodes,
+            initialRates: Map<String, double>.from(_ratesToBase),
           );
       // main.dart's StreamBuilder will swap to RootShell automatically.
     } catch (_) {
@@ -130,25 +145,61 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
   @override
   Widget build(BuildContext context) {
     _applyLocaleDefault(context);
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 260),
-      switchInCurve: Curves.easeOutCubic,
-      switchOutCurve: Curves.easeInCubic,
-      transitionBuilder: (child, animation) {
-        return FadeTransition(
-          opacity: animation,
-          child: SlideTransition(
-            position: Tween<Offset>(
-              begin: const Offset(0.0, 0.04),
-              end: Offset.zero,
-            ).animate(animation),
-            child: child,
+    return Scaffold(
+      backgroundColor: CropkeepColors.bgScreen,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 12, 24, 20),
+          child: Column(
+            children: [
+              OnboardingTopBar(
+                onBack: _backCallback,
+                step: _currentStep,
+                totalSteps: _totalSteps,
+              ),
+              Expanded(
+                child: ClipRect(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 320),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    layoutBuilder: (currentChild, previousChildren) {
+                      return Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          ...previousChildren,
+                          ?currentChild,
+                        ],
+                      );
+                    },
+                    transitionBuilder: (child, animation) {
+                      final key = (child.key as ValueKey<int>?)?.value;
+                      final isIncoming = key == _pageIndex;
+                      final begin = isIncoming
+                          ? (_forward
+                              ? const Offset(1, 0)
+                              : const Offset(-1, 0))
+                          : (_forward
+                              ? const Offset(-1, 0)
+                              : const Offset(1, 0));
+                      return SlideTransition(
+                        position: Tween<Offset>(
+                          begin: begin,
+                          end: Offset.zero,
+                        ).animate(animation),
+                        child: child,
+                      );
+                    },
+                    child: KeyedSubtree(
+                      key: ValueKey<int>(_pageIndex),
+                      child: _buildPage(),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
-        );
-      },
-      child: KeyedSubtree(
-        key: ValueKey<int>(_pageIndex),
-        child: _buildPage(),
+        ),
       ),
     );
   }
@@ -156,26 +207,15 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
   Widget _buildPage() {
     switch (_pageIndex) {
       case _welcome:
-        return _WelcomePage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onContinue: _goNext,
-        );
+        return _WelcomePage(onContinue: _goNext);
       case _name:
         return _NamePage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
           nameController: _nameController,
           avatarId: _avatarId,
-          onAvatarChanged: (id) => setState(() => _avatarId = id),
           onContinue: _goNext,
         );
       case _baseCurrency:
         return _BaseCurrencyPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
           selectedCode: _baseCode,
           onSelected: (code) {
             setState(() {
@@ -187,9 +227,6 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
         );
       case _secondaryCurrencies:
         return _SecondaryCurrenciesPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
           baseCode: _baseCode ?? 'USD',
           selectedCodes: _secondaryCodes,
           onToggle: (code, enabled) {
@@ -209,9 +246,6 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
         );
       case _wellsTeach:
         return _TeachPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
           heroAsset: 'assets/icons/well.svg',
           heading: 'Wells are where money comes from',
           subtext:
@@ -220,9 +254,6 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
         );
       case _bonusWellsTeach:
         return _TeachPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
           heroAsset: 'assets/icons/treasure.svg',
           heading: 'Variable income is a bonus, not a budget',
           subtext:
@@ -230,39 +261,31 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
           onContinue: _goNext,
         );
       case _cropsTeach:
-        return _CropsTeachPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
-          onContinue: _goNext,
-        );
+        return _CropsTeachPage(onContinue: _goNext);
       case _marketTeach:
         return _TeachPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
           heroAsset: 'assets/icons/fertilizers/fertilizer.svg',
           heading: 'Healthy harvests earn coins',
           subtext:
               "When the cycle closes, every healthy plot pays out coins — with the biggest bonus reserved for spending less than you earned overall. Spend coins on the Market tab: new crop types, fertilizers that boost a plot's yield, farm decorations, and skins. Purchases are forever; there's no sell-back.",
           onContinue: _goNext,
         );
-      case _exchangeTeach:
-        return _TeachPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
-          heroAsset: 'assets/icons/exchange.svg',
-          heading: 'Exchange rates are set at harvest',
-          subtext:
-              "At the start of each cycle you set one rate per currency pair. It's locked for the whole cycle — no live FX during the month — so the math is predictable. You'll set your first rates at the next harvest.",
-          onContinue: _goNext,
+      case _exchangeRates:
+        return _ExchangeRatesPage(
+          baseCode: _baseCode ?? 'USD',
+          secondaryCodes: _secondaryCodes.toList(),
+          initialRatesToBase: _ratesToBase,
+          onContinue: (rates) {
+            setState(() {
+              _ratesToBase
+                ..clear()
+                ..addAll(rates);
+            });
+            _goNext();
+          },
         );
       case _allSet:
         return _AllSetPage(
-          step: _currentStep,
-          totalSteps: _totalSteps,
-          onBack: _backCallback,
           farmerName: _nameController.text.trim(),
           submitting: _submitting,
           onEnterFarm: _submit,
@@ -274,21 +297,13 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
 }
 
 class _WelcomePage extends StatelessWidget {
-  const _WelcomePage({
-    required this.step,
-    required this.totalSteps,
-    required this.onContinue,
-  });
+  const _WelcomePage({required this.onContinue});
 
-  final int step;
-  final int totalSteps;
   final VoidCallback onContinue;
 
   @override
   Widget build(BuildContext context) {
     return OnboardingShell(
-      step: step,
-      totalSteps: totalSteps,
       heroAsset: 'assets/branding/logo.png',
       heading: 'Welcome to Cropkeep',
       subtext:
@@ -301,24 +316,14 @@ class _WelcomePage extends StatelessWidget {
 
 class _NamePage extends StatelessWidget {
   const _NamePage({
-    required this.step,
-    required this.totalSteps,
-    required this.onBack,
     required this.nameController,
     required this.avatarId,
-    required this.onAvatarChanged,
     required this.onContinue,
   });
 
-  final int step;
-  final int totalSteps;
-  final VoidCallback? onBack;
   final TextEditingController nameController;
   final String avatarId;
-  final ValueChanged<String> onAvatarChanged;
   final VoidCallback onContinue;
-
-  static const List<String> _avatarOptions = ['farmer', 'farmer-fl'];
 
   @override
   Widget build(BuildContext context) {
@@ -327,9 +332,6 @@ class _NamePage extends StatelessWidget {
       builder: (context, _) {
         final hasName = nameController.text.trim().isNotEmpty;
         return OnboardingShell(
-          step: step,
-          totalSteps: totalSteps,
-          onBack: onBack,
           heroAsset: AvatarPickerSheet.assetFor(avatarId),
           heading: 'What should we call you?',
           subtext:
@@ -383,21 +385,6 @@ class _NamePage extends StatelessWidget {
                   if (hasName) onContinue();
                 },
               ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  for (int i = 0; i < _avatarOptions.length; i++) ...[
-                    if (i > 0) const SizedBox(width: 12),
-                    Expanded(
-                      child: AvatarTile(
-                        avatarId: _avatarOptions[i],
-                        isSelected: _avatarOptions[i] == avatarId,
-                        onTap: () => onAvatarChanged(_avatarOptions[i]),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
             ],
           ),
         );
@@ -408,17 +395,11 @@ class _NamePage extends StatelessWidget {
 
 class _BaseCurrencyPage extends StatelessWidget {
   const _BaseCurrencyPage({
-    required this.step,
-    required this.totalSteps,
-    required this.onBack,
     required this.selectedCode,
     required this.onSelected,
     required this.onContinue,
   });
 
-  final int step;
-  final int totalSteps;
-  final VoidCallback? onBack;
   final String? selectedCode;
   final ValueChanged<String> onSelected;
   final VoidCallback onContinue;
@@ -426,9 +407,6 @@ class _BaseCurrencyPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return OnboardingShell(
-      step: step,
-      totalSteps: totalSteps,
-      onBack: onBack,
       heroAsset: 'assets/icons/coin.svg',
       heading: 'What currency do you think in?',
       subtext: 'All your totals show in this one. Pick whichever you mostly spend in.',
@@ -562,9 +540,6 @@ class _RadioDot extends StatelessWidget {
 
 class _SecondaryCurrenciesPage extends StatelessWidget {
   const _SecondaryCurrenciesPage({
-    required this.step,
-    required this.totalSteps,
-    required this.onBack,
     required this.baseCode,
     required this.selectedCodes,
     required this.onToggle,
@@ -572,9 +547,6 @@ class _SecondaryCurrenciesPage extends StatelessWidget {
     required this.onSkip,
   });
 
-  final int step;
-  final int totalSteps;
-  final VoidCallback? onBack;
   final String baseCode;
   final Set<String> selectedCodes;
   final void Function(String code, bool enabled) onToggle;
@@ -588,9 +560,6 @@ class _SecondaryCurrenciesPage extends StatelessWidget {
         if (spec.code != baseCode) spec,
     ];
     return OnboardingShell(
-      step: step,
-      totalSteps: totalSteps,
-      onBack: onBack,
       heroAsset: 'assets/icons/coin.svg',
       heading: 'Use any other currencies?',
       subtext:
@@ -632,18 +601,12 @@ class _SecondaryCurrenciesPage extends StatelessWidget {
 
 class _TeachPage extends StatelessWidget {
   const _TeachPage({
-    required this.step,
-    required this.totalSteps,
-    required this.onBack,
     required this.heroAsset,
     required this.heading,
     required this.subtext,
     required this.onContinue,
   });
 
-  final int step;
-  final int totalSteps;
-  final VoidCallback? onBack;
   final String heroAsset;
   final String heading;
   final String subtext;
@@ -652,9 +615,6 @@ class _TeachPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return OnboardingShell(
-      step: step,
-      totalSteps: totalSteps,
-      onBack: onBack,
       heroAsset: heroAsset,
       heading: heading,
       subtext: subtext,
@@ -664,16 +624,8 @@ class _TeachPage extends StatelessWidget {
 }
 
 class _CropsTeachPage extends StatelessWidget {
-  const _CropsTeachPage({
-    required this.step,
-    required this.totalSteps,
-    required this.onBack,
-    required this.onContinue,
-  });
+  const _CropsTeachPage({required this.onContinue});
 
-  final int step;
-  final int totalSteps;
-  final VoidCallback? onBack;
   final VoidCallback onContinue;
 
   static const List<String> _exampleCrops = [
@@ -685,9 +637,6 @@ class _CropsTeachPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return OnboardingShell(
-      step: step,
-      totalSteps: totalSteps,
-      onBack: onBack,
       heroAsset: 'assets/icons/crops/wheat.svg',
       heading: 'Plots are your budget categories',
       subtext:
@@ -730,19 +679,350 @@ class _CropExampleTile extends StatelessWidget {
   }
 }
 
+// Auto-fetches today's rates from the FX provider for each selected
+// secondary currency; falls back to manual entry when the network is
+// down. Values are displayed and edited in the *per-base* form the user
+// thinks in ("1 USD = 56.30 PHP"), inverted to the storage form
+// (rate-to-base) on continue so `_convertMinor` consumes the right
+// number downstream.
+class _ExchangeRatesPage extends StatefulWidget {
+  const _ExchangeRatesPage({
+    required this.baseCode,
+    required this.secondaryCodes,
+    required this.initialRatesToBase,
+    required this.onContinue,
+  });
+
+  final String baseCode;
+  final List<String> secondaryCodes;
+  final Map<String, double> initialRatesToBase;
+  final ValueChanged<Map<String, double>> onContinue;
+
+  @override
+  State<_ExchangeRatesPage> createState() => _ExchangeRatesPageState();
+}
+
+class _ExchangeRatesPageState extends State<_ExchangeRatesPage> {
+  final Map<String, TextEditingController> _controllers = {};
+  bool _loading = true;
+  String? _fetchError;
+
+  @override
+  void initState() {
+    super.initState();
+    for (final code in widget.secondaryCodes) {
+      _controllers[code] = TextEditingController()..addListener(_onAnyChange);
+    }
+    // If the user is returning to this page, skip the fetch and reuse
+    // values they already saw/entered.
+    final hasAllInitial = widget.secondaryCodes
+        .every((c) => widget.initialRatesToBase.containsKey(c));
+    if (hasAllInitial && widget.secondaryCodes.isNotEmpty) {
+      for (final code in widget.secondaryCodes) {
+        _controllers[code]!.text = _formatPerBase(
+          1.0 / widget.initialRatesToBase[code]!,
+        );
+      }
+      _loading = false;
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _fetch());
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final c in _controllers.values) {
+      c.removeListener(_onAnyChange);
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  void _onAnyChange() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _fetch() async {
+    setState(() {
+      _loading = true;
+      _fetchError = null;
+    });
+    try {
+      final svc = FxRatesService();
+      final rates = await svc.fetchRatesToBase(
+        baseCode: widget.baseCode,
+        targetCodes: widget.secondaryCodes,
+      );
+      svc.dispose();
+      if (!mounted) return;
+      for (final code in widget.secondaryCodes) {
+        final rateToBase = rates[code];
+        if (rateToBase != null && rateToBase > 0) {
+          _controllers[code]!.text = _formatPerBase(1.0 / rateToBase);
+        }
+      }
+      setState(() => _loading = false);
+    } on FxRatesException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _fetchError = e.message;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _fetchError = '$e';
+      });
+    }
+  }
+
+  bool get _canContinue {
+    if (_loading) return false;
+    for (final code in widget.secondaryCodes) {
+      final v = double.tryParse(_controllers[code]!.text.trim());
+      if (v == null || v <= 0) return false;
+    }
+    return true;
+  }
+
+  void _handleContinue() {
+    final out = <String, double>{};
+    for (final code in widget.secondaryCodes) {
+      final perBase = double.tryParse(_controllers[code]!.text.trim());
+      if (perBase == null || perBase <= 0) return;
+      out[code] = 1.0 / perBase;
+    }
+    widget.onContinue(out);
+  }
+
+  static String _formatPerBase(double perBase) {
+    if (perBase >= 100) return perBase.toStringAsFixed(2);
+    if (perBase >= 1) return perBase.toStringAsFixed(3);
+    return perBase.toStringAsFixed(5);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return OnboardingShell(
+      heroAsset: 'assets/icons/exchange.svg',
+      heading: "Today's exchange rates",
+      subtext:
+          "We grabbed today's rates so you don't have to type them. Tap any to override — at the start of each cycle, we'll pull fresh ones automatically.",
+      onContinue: _canContinue ? _handleContinue : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (_loading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 32),
+              child: Center(
+                child: CircularProgressIndicator(
+                  color: CropkeepColors.greenPrimary,
+                ),
+              ),
+            )
+          else ...[
+            if (_fetchError != null) ...[
+              _FxFallbackBanner(onRetry: _fetch),
+              const SizedBox(height: 16),
+            ],
+            Container(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: CropkeepColors.borderCard,
+                  width: 1.5,
+                ),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: Column(
+                children: [
+                  for (int i = 0; i < widget.secondaryCodes.length; i++) ...[
+                    if (i > 0)
+                      const Divider(
+                        height: 1,
+                        thickness: 1,
+                        color: CropkeepColors.borderDivider,
+                      ),
+                    _RateInputRow(
+                      baseCode: widget.baseCode,
+                      code: widget.secondaryCodes[i],
+                      controller: _controllers[widget.secondaryCodes[i]]!,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _RateInputRow extends StatelessWidget {
+  const _RateInputRow({
+    required this.baseCode,
+    required this.code,
+    required this.controller,
+  });
+
+  final String baseCode;
+  final String code;
+  final TextEditingController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final spec = CurrencyCatalog.findByCode(code);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          if (spec != null)
+            SvgPicture.asset(
+              spec.flagAsset,
+              width: 28,
+              height: 28,
+              fit: BoxFit.contain,
+            ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '1 $baseCode =',
+                  style: const TextStyle(
+                    fontFamily: 'Nunito',
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: CropkeepColors.textSecondary,
+                    height: 1.2,
+                  ),
+                ),
+                Text(
+                  code,
+                  style: const TextStyle(
+                    fontFamily: 'Nunito',
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: CropkeepColors.textPrimary,
+                    height: 1.3,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          SizedBox(
+            width: 120,
+            child: TextField(
+              controller: controller,
+              keyboardType:
+                  const TextInputType.numberWithOptions(decimal: true),
+              textAlign: TextAlign.right,
+              style: const TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                color: CropkeepColors.textPrimary,
+              ),
+              decoration: InputDecoration(
+                isDense: true,
+                hintText: '0.00',
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(
+                    color: CropkeepColors.borderCard,
+                    width: 1.5,
+                  ),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(
+                    color: CropkeepColors.greenPrimary,
+                    width: 2,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FxFallbackBanner extends StatelessWidget {
+  const _FxFallbackBanner({required this.onRetry});
+
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF6E5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: const Color(0xFFEED6A6),
+          width: 1.2,
+        ),
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.cloud_off_rounded,
+            size: 20,
+            color: Color(0xFFB97A1A),
+          ),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Text(
+              "Couldn't reach the FX provider. Enter today's rates manually, or retry.",
+              style: TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: Color(0xFF5A4416),
+                height: 1.35,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          TextButton(
+            onPressed: onRetry,
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFFB97A1A),
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              minimumSize: const Size(0, 32),
+              textStyle: const TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            child: const Text('Retry'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _AllSetPage extends StatelessWidget {
   const _AllSetPage({
-    required this.step,
-    required this.totalSteps,
-    required this.onBack,
     required this.farmerName,
     required this.submitting,
     required this.onEnterFarm,
   });
 
-  final int step;
-  final int totalSteps;
-  final VoidCallback? onBack;
   final String farmerName;
   final bool submitting;
   final VoidCallback onEnterFarm;
@@ -751,9 +1031,6 @@ class _AllSetPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final name = farmerName.isEmpty ? 'farmer' : farmerName;
     return OnboardingShell(
-      step: step,
-      totalSteps: totalSteps,
-      onBack: submitting ? null : onBack,
       heroAsset: 'assets/icons/cornucopia.svg',
       heading: 'Your farm is ready',
       subtext:

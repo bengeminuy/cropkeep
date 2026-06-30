@@ -16,7 +16,7 @@ The cycle-close calculator emits one `CoinLedgerRow` per reason and a final delt
 | `unplannedHealthyShare` | flat: harvested=15, mildStress=5, else 0 | 15 |
 | `cycleOverallPositive` | excellent=40, solidlyPositive=20, barelyPositive=10, negative=0 | 20 |
 | `cycleComboBonus` | +15 if all budgeted plots ≥ mildStress; +25 if all harvested | 15–25 |
-| `cropSetBonus` | from `CropSetSpec.bonusCoins` (30/40/60/60/60/120), once per cycle a set is completed | 0–120 |
+| ~~`cropSetBonus`~~ | **paused for v1** — see [`md/to-do.md`](to-do.md) §"Set bonuses paused for v1" | — |
 | `surplusSaved` | `floor(coinsSavedToBarn / 10)`, capped at +50/cycle | 0–50 |
 | `badgeUnlocked` | 25 per first-time badge | episodic |
 | `levelUpBonus` | `50 × newLevel` | episodic |
@@ -27,18 +27,27 @@ The cycle-close calculator emits one `CoinLedgerRow` per reason and a final delt
 
 ## 1. Crops
 
-Consumable seed packs. Plant 1 seed per plot per cycle; harvested healthy = yield, mildStress = half yield, withered/dead = 0. Set completion fires once when all crops in a set are planted across plots and all harvest healthy.
+Consumable seed packs. Each plot consumes 1 seed per cycle it's active for, deducted at the moment of planting — mid-cycle creation (or crop reassignment) pays the seed up-front, then cycle start pays again for every subsequent cycle the plot persists. No refund on plot removal or crop reassignment. See [`md/database.md`](database.md) §"Two seed-consumption points" for the full rule.
 
-| Tier | Price | Pack | Yield/seed | Pack max | Break-even |
-|---|---|---|---|---|---|
-| Starter (Wheat / Apple / Potato — free) | 0 | ∞ | 5 | — | n/a |
-| Common (Corn / Barley / Carrot / Lettuce) | 75c | 5 | 25 | 125 | 3/5 |
-| Uncommon (Peach / Pear / Tomato / Eggplant / Bell pepper) | 175c | 5 | 40 | 200 | ~4.4/5 |
-| Rare (Strawberry / Raspberry / Blueberry / Mango / Orange / Pineapple) | 300c | 5 | 75 | 375 | 4/5 |
+Harvested healthy = full yield, mildStress = half yield, withered/dead = 0. Set bonuses are **paused for v1** — see [`md/to-do.md`](to-do.md) §"Set bonuses paused for v1". The `MarketCatalog.sets` catalog and the `setId` field on each crop stay dormant until the feature returns.
 
-### Sets
+| Tier | Price | Pack | Yield/seed |
+|---|---|---|---|
+| Starter (Wheat / Apple / Potato — free) | 0 | ∞ | 5 |
+| Common (Corn / Barley / Carrot / Lettuce) | 75c | 5 | 25 |
+| Uncommon (Peach / Pear / Tomato / Eggplant / Bell pepper) | 175c | 5 | 40 |
+| Rare (Strawberry / Raspberry / Blueberry / Mango / Orange / Pineapple) | 300c | 5 | 75 |
 
-| Set | Bonus | Crops |
+No inventory cap — players can hoard packs freely.
+
+### Sets (paused for v1)
+
+Set bonuses are paused for v1 — the catalog below is preserved as the
+single source of truth for when the feature returns, but no coins are
+awarded today. See [`md/to-do.md`](to-do.md) §"Set bonuses paused for
+v1" for the rationale and what's needed to bring them back.
+
+| Set | Bonus (when re-enabled) | Crops |
 |---|---|---|
 | Grain trio | 30c | Wheat, Corn, Barley |
 | The Orchard | 40c | Apple, Peach, Pear |
@@ -62,7 +71,7 @@ Consumables, applied mid-cycle. One per plot per cycle (enforced by `unique(cycl
 | Liquid Boost | 45c | +35% coin yield on harvest | `liquid-fertilizer` |
 | Pumpkin Bloom | 60c | +50% coin yield on harvest | `pumpkin` |
 | Storm Umbrella | 80c | mildStress treated as harvested for that plot's coin yield | `umbrella` |
-| Buzzing Beehive | 90c | All plots in the farm get +10% yield this cycle | `beehive` |
+| Buzzing Beehive | 90c | +25% coin yield AND plot is stress-proof (any final state pays as if harvested healthy) | `beehive` |
 | Faerie Reviver | 120c | Withered → mildStress (recovers 50% yield) | `fairy` |
 | Mystic Potion | 200c | +100% yield, but plot must finish harvested or yields 0 | `mana` |
 
@@ -81,7 +90,12 @@ Permanent global passives. Buy once, always active. Unlimited ownership — all 
 | Potted Heirloom | 900c | All fertilizer prices −20% | ~10 cycles for fertilizer-heavy players | `potted-plant` |
 | Eternal Sun | 1500c | +10% to all `plotHarvestedHealthy`, permanent | ~50 cycles, prestige | `sun` |
 | Crystal Aquifer | 1800c | Carryover well lifts next cycle's `cycleOverallPositive` by one tier if rollover ≥10% of income | ~60 cycles for big savers | `crystal` |
-| Treasure Vault | 2000c | Barn balance earns +1c per cycle per 100c stored, cap +20/cycle | scales with barn size, top-tier prestige | `safe` |
+
+A top-tier "barn interest" decoration was considered (Treasure Vault,
+2000c, +1c per 100c stored) but dropped — the barn is denominated in
+the user's base currency, so any payout formula tied to the barn
+balance would scale wildly across currencies (USD vs JPY vs PHP). The
+2000c prestige slot is open for a currency-agnostic replacement.
 
 ---
 
@@ -95,18 +109,13 @@ Equipped-only passives. One equipped per slot. Free defaults always exist; cheap
 |---|---|---|---|
 | Default Farmer | 0 | cosmetic | `farmer-male` |
 | Pirate Sailor | 150c | cosmetic | `pirate` |
-| Beekeeper | 600c | `cropSetBonus` payouts +25% while equipped | `beekeeper` |
+| Beekeeper | 600c | Cosmetic for v1 — passive slot open while set bonuses are paused (was `cropSetBonus` payouts +25%) | `beekeeper` |
 | Forest Elf | 1200c | +5% yield to all plots | `legolas` |
 | Arcane Wizard | 2500c | +10% yield, mildStress counted as harvested for combo bonus | `gandalf` |
 
-### Plot color (`OwnedItemType.plotColor`) — equipped per-plot, **no icons** (background color swatches; existing implementation in [`lib/theme/plot_swatches.dart`](../lib/theme/plot_swatches.dart))
-
-| Item | Price | Effect |
-|---|---|---|
-| Soil brown | 0 | cosmetic default |
-| Loam / Clay / Ash / Moss / Snow | 50c each | cosmetic |
-| Obsidian black | 500c | Chosen plot gets +15% yield (re-assignable) |
-| Volcanic red | 1500c | Chosen plot's withered is treated as mildStress |
+Plot colors are NOT a Market item. They're an organizational tool —
+players pick from the full palette in [`lib/theme/plot_swatches.dart`](../lib/theme/plot_swatches.dart)
+freely on plot create/edit. No coin gate; no Market entry.
 
 ---
 
@@ -114,20 +123,19 @@ Equipped-only passives. One equipped per slot. Free defaults always exist; cheap
 
 Per-plot yield modifiers stack **additively** with a hard **+50% per-plot cap**.
 
-**Counts toward the cap:** Fertilizer Mix (+15%), Compost Heap (+25%), Liquid Boost (+35%), Pumpkin Bloom (+50%), Eternal Sun (+10%), Forest Elf (+5%), Arcane Wizard (+10%), Obsidian black (+15% on chosen plot).
+**Counts toward the cap:** Fertilizer Mix (+15%), Compost Heap (+25%), Liquid Boost (+35%), Pumpkin Bloom (+50%), Buzzing Beehive (+25%), Eternal Sun (+10%), Forest Elf (+5%), Arcane Wizard (+10%).
 
 **Special cases:**
 - **Mystic Potion (+100%)** bypasses the cap but yields 0 on any non-harvested state.
-- **Buzzing Beehive (+10% farm-wide)** is applied *after* the per-plot cap (multiplicative outer layer).
 - **Flat coin sources** live outside the cap: Stone Fountain's +1c/harvest, Mushroom Gnome's +5c, Wishing Windmill's +10c on Unplanned.
-- **State-transform sources** also outside the cap: Storm Umbrella (mildStress→harvested), Faerie Reviver (withered→mildStress), Volcanic red (withered→mildStress).
-- **Cycle-level bonuses** are never per-plot and never capped: set bonus, combo bonus, tier bonus, surplus saved, Beekeeper's +25% set-bonus boost, Iron Pitchfork's combo-protect, Crystal Aquifer's tier lift, Treasure Vault's interest, Arcane Wizard's combo override.
+- **State-transform sources** also outside the cap: Storm Umbrella (mildStress→harvested), Faerie Reviver (withered→mildStress), Buzzing Beehive (any final state→harvested-equivalent payout).
+- **Cycle-level bonuses** are never per-plot and never capped: combo bonus, tier bonus, surplus saved, Iron Pitchfork's combo-protect, Crystal Aquifer's tier lift, Arcane Wizard's combo override. (Set bonus and Beekeeper's +25% boost are paused for v1.)
 
 ---
 
 ## 6. Trajectory sanity check (first 5 cycles)
 
-Solidly-positive new player. Confirms first purchase happens cycle 1, first set completion by cycle 5, no dead cycles.
+Solidly-positive new player. Confirms first purchase happens cycle 1, no dead cycles. Set-bonus column intentionally absent — paused for v1.
 
 | Cycle | Earnings | Spend | End balance |
 |---|---|---|---|
@@ -136,7 +144,7 @@ Solidly-positive new player. Confirms first purchase happens cycle 1, first set 
 | 2 | 3 starter (15) + Corn (25) + Unplanned (15) + tier (20) + combo (15) = **90** | — | 90 |
 | 3 | 90 | Carrot (75c) | 105 |
 | 4 | 2 starter (10) + Corn + Carrot (50) + Unplanned (15) + tier (20) + combo (15) = **110**; +5 surplus | Barley (75c) | 145 |
-| 5 | 1 starter (5) + Corn + Carrot + Barley (75) + Unplanned (15) + tier (20) + combo (15) + **grain trio (30)** = **160**; +5 surplus | — | 310 |
+| 5 | 1 starter (5) + Corn + Carrot + Barley (75) + Unplanned (15) + tier (20) + combo (15) = **130**; +5 surplus | — | 280 |
 
 **Long-game milestones:** Fertilizer Mix reachable cycle 1, Mushroom Gnome ~cycle 15, first functional skin (Beekeeper 600c) ~cycle 30, Eternal Sun / Arcane Wizard 50+ cycles.
 
@@ -164,7 +172,6 @@ Each item below is an icons8 Color-style icon, verified at `https://img.icons8.c
 - [x] `potted-plant.svg` (already present)
 - [x] `sun.svg` (already present)
 - [ ] `crystal.svg` (Crystal Aquifer)
-- [ ] `safe.svg` (Treasure Vault)
 
 ### Avatars — `assets/icons/avatars/`
 - [ ] `farmer-male.svg` (or reuse existing [`assets/icons/farmer.svg`](../assets/icons/farmer.svg))

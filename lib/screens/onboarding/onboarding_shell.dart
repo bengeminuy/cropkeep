@@ -9,109 +9,91 @@ class OnboardingShell extends StatelessWidget {
     required this.heroAsset,
     required this.heading,
     required this.subtext,
-    required this.step,
-    required this.totalSteps,
     this.child,
     this.onContinue,
     this.continueLabel,
     this.onSkip,
     this.skipLabel,
-    this.onBack,
   });
 
   final String heroAsset;
   final String heading;
   final String subtext;
-  final int step;
-  final int totalSteps;
   final Widget? child;
   final VoidCallback? onContinue;
   final String? continueLabel;
   final VoidCallback? onSkip;
   final String? skipLabel;
-  final VoidCallback? onBack;
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: CropkeepColors.bgScreen,
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(24, 12, 24, 20),
-          child: Column(
-            children: [
-              _TopBar(
-                onBack: onBack,
-                step: step,
-                totalSteps: totalSteps,
+    return Column(
+      children: [
+        Expanded(
+          child: SingleChildScrollView(
+            physics: const ClampingScrollPhysics(),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minHeight: MediaQuery.of(context).size.height * 0.62,
               ),
-              Expanded(
-                child: SingleChildScrollView(
-                  physics: const ClampingScrollPhysics(),
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      minHeight: MediaQuery.of(context).size.height * 0.62,
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const SizedBox(height: 24),
-                        Center(child: _HeroDisc(assetPath: heroAsset)),
-                        const SizedBox(height: 36),
-                        Text(
-                          heading,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            fontFamily: 'Nunito',
-                            fontSize: 26,
-                            fontWeight: FontWeight.w800,
-                            color: CropkeepColors.textPrimary,
-                            height: 1.2,
-                            letterSpacing: -0.3,
-                          ),
-                        ),
-                        const SizedBox(height: 14),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 4),
-                          child: Text(
-                            subtext,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              fontFamily: 'Nunito',
-                              fontSize: 14,
-                              fontWeight: FontWeight.w400,
-                              color: CropkeepColors.textSecondary,
-                              height: 1.6,
-                            ),
-                          ),
-                        ),
-                        if (child != null) ...[
-                          const SizedBox(height: 28),
-                          child!,
-                        ],
-                        const SizedBox(height: 24),
-                      ],
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(height: 24),
+                  Center(child: _HeroDisc(assetPath: heroAsset)),
+                  const SizedBox(height: 36),
+                  Text(
+                    heading,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 26,
+                      fontWeight: FontWeight.w800,
+                      color: CropkeepColors.textPrimary,
+                      height: 1.2,
+                      letterSpacing: -0.3,
                     ),
                   ),
-                ),
+                  const SizedBox(height: 14),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Text(
+                      subtext,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontFamily: 'Nunito',
+                        fontSize: 14,
+                        fontWeight: FontWeight.w400,
+                        color: CropkeepColors.textSecondary,
+                        height: 1.6,
+                      ),
+                    ),
+                  ),
+                  if (child != null) ...[
+                    const SizedBox(height: 28),
+                    child!,
+                  ],
+                  const SizedBox(height: 24),
+                ],
               ),
-              _FooterButtons(
-                onContinue: onContinue,
-                continueLabel: continueLabel ?? 'Continue',
-                onSkip: onSkip,
-                skipLabel: skipLabel ?? 'Skip for now',
-              ),
-            ],
+            ),
           ),
         ),
-      ),
+        _FooterButtons(
+          onContinue: onContinue,
+          continueLabel: continueLabel ?? 'Continue',
+          onSkip: onSkip,
+          skipLabel: skipLabel ?? 'Skip for now',
+        ),
+      ],
     );
   }
 }
 
-class _TopBar extends StatelessWidget {
-  const _TopBar({
+class OnboardingTopBar extends StatelessWidget {
+  const OnboardingTopBar({
+    super.key,
     required this.onBack,
     required this.step,
     required this.totalSteps,
@@ -130,20 +112,24 @@ class _TopBar extends StatelessWidget {
           SizedBox(
             width: 40,
             height: 40,
-            child: onBack == null
-                ? null
-                : Material(
-                    color: Colors.transparent,
-                    child: InkWell(
-                      onTap: onBack,
-                      borderRadius: BorderRadius.circular(12),
-                      child: const Icon(
-                        Icons.arrow_back_rounded,
-                        size: 22,
-                        color: CropkeepColors.textPrimary,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 200),
+              child: onBack == null
+                  ? const SizedBox.shrink(key: ValueKey('back-empty'))
+                  : Material(
+                      key: const ValueKey('back-button'),
+                      color: Colors.transparent,
+                      child: InkWell(
+                        onTap: onBack,
+                        borderRadius: BorderRadius.circular(12),
+                        child: const Icon(
+                          Icons.arrow_back_rounded,
+                          size: 22,
+                          color: CropkeepColors.textPrimary,
+                        ),
                       ),
                     ),
-                  ),
+            ),
           ),
           Expanded(
             child: Center(child: _ProgressPills(step: step, total: totalSteps)),

@@ -3,10 +3,10 @@ import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../theme/colors.dart';
 
-// Coin balance card + "Affordable only" toggle. Sits between the
-// category chips and the page body. The header pill is the global
-// wallet; this is Market-local reinforcement so the user can keep
-// their eyes on the cards.
+// Slim hero bar above the category chips. The global header already
+// shows the wallet — this is in-context reinforcement plus the
+// "affordable only" filter on a single row, instead of the previous
+// full-bleed COIN BALANCE card that doubled the top chrome.
 class MarketResourceStrip extends StatelessWidget {
   const MarketResourceStrip({
     super.key,
@@ -22,57 +22,64 @@ class MarketResourceStrip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: CropkeepColors.borderCard, width: 1.5),
+        color: CropkeepColors.bgHero,
+        borderRadius: BorderRadius.circular(14),
       ),
       child: Row(
         children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'COIN BALANCE',
-                  style: TextStyle(
-                    fontFamily: 'Nunito',
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.6,
-                    color: CropkeepColors.textSecondary,
-                    height: 1,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    SvgPicture.asset(
-                      'assets/icons/coin.svg',
-                      width: 22,
-                      height: 22,
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      _formatCoins(coinBalance),
-                      style: const TextStyle(
-                        fontFamily: 'Nunito',
-                        fontSize: 22,
-                        fontWeight: FontWeight.w800,
-                        color: CropkeepColors.textGold,
-                        height: 1,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
+          _WalletPill(coinBalance: coinBalance),
+          const Spacer(),
           _AffordableToggle(
             value: affordableOnly,
             onChanged: onAffordableToggled,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WalletPill extends StatelessWidget {
+  const _WalletPill({required this.coinBalance});
+
+  final int coinBalance;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+      decoration: BoxDecoration(
+        color: CropkeepColors.bgGoldWash,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: CropkeepColors.borderGoldPill, width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SvgPicture.asset('assets/icons/coin.svg', width: 18, height: 18),
+          const SizedBox(width: 6),
+          Text(
+            _formatCoins(coinBalance),
+            style: const TextStyle(
+              fontFamily: 'Nunito',
+              fontSize: 15,
+              fontWeight: FontWeight.w800,
+              color: CropkeepColors.textGoldDeep,
+              height: 1,
+            ),
+          ),
+          const SizedBox(width: 6),
+          const Text(
+            'in wallet',
+            style: TextStyle(
+              fontFamily: 'Nunito',
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: CropkeepColors.textGoldDeep,
+              height: 1,
+            ),
           ),
         ],
       ),
@@ -92,16 +99,16 @@ class _AffordableToggle extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       onTap: () => onChanged(!value),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
+        duration: const Duration(milliseconds: 180),
         curve: Curves.easeOut,
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
         decoration: BoxDecoration(
-          color: value ? CropkeepColors.greenLight : Colors.transparent,
+          color: value ? CropkeepColors.greenPrimary : Colors.transparent,
           borderRadius: BorderRadius.circular(999),
           border: Border.all(
             color: value
                 ? CropkeepColors.greenPrimary
-                : CropkeepColors.borderGoldPill,
+                : CropkeepColors.textSecondaryOnHero.withValues(alpha: 0.45),
             width: 1.2,
           ),
         ),
@@ -109,11 +116,11 @@ class _AffordableToggle extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              value ? Icons.check_rounded : Icons.tune_rounded,
+              value ? Icons.check_rounded : Icons.filter_alt_outlined,
               size: 14,
               color: value
-                  ? CropkeepColors.textGreenDeep
-                  : CropkeepColors.textGoldDeep,
+                  ? CropkeepColors.textOnGreenBtn
+                  : CropkeepColors.textSecondaryOnHero,
             ),
             const SizedBox(width: 4),
             Text(
@@ -123,8 +130,8 @@ class _AffordableToggle extends StatelessWidget {
                 fontSize: 12,
                 fontWeight: FontWeight.w700,
                 color: value
-                    ? CropkeepColors.textGreenDeep
-                    : CropkeepColors.textGoldDeep,
+                    ? CropkeepColors.textOnGreenBtn
+                    : CropkeepColors.textSecondaryOnHero,
                 height: 1,
               ),
             ),

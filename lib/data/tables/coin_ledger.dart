@@ -8,8 +8,14 @@ enum CoinReason {
   unplannedHealthyShare,
   cycleOverallPositive,
   cycleComboBonus,
+  // Dormant — set bonuses are paused for v1 (see md/to-do.md). The
+  // enum value and the 'crop_set_bonus' CHECK entry below stay in place
+  // because dropping the CHECK string requires a `.g.dart` regen, and
+  // build_runner 2.15.0 is broken on Dart 3.10. Nothing inserts rows
+  // with this reason while the feature is paused.
   cropSetBonus,
   surplusSaved,
+  // Dormant — progression (XP, levels, badges) was removed from v1.
   badgeUnlocked,
   levelUpBonus,
   marketPurchase,

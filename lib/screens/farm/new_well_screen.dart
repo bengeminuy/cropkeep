@@ -4,9 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import '../../app_scope.dart';
 import '../../data/currency_catalog.dart';
+import '../../data/database.dart' show CurrencyRow, ExchangeRateRow;
 import '../../data/tables/wells.dart' show WellType;
 import '../../theme/colors.dart';
+import '../../widgets/cropkeep_toast.dart';
 
 // ──────────────────────────────────────────────────────────────────────────
 // NewWellScreen — well creation flow.
@@ -63,21 +66,91 @@ class _NewWellScreenState extends State<NewWellScreen> {
   final TextEditingController _expectedCtrl = TextEditingController();
   final TextEditingController _minCtrl = TextEditingController();
   final TextEditingController _maxCtrl = TextEditingController();
-  late _Currency _selected;
+  _Currency? _selected;
+  List<_Currency> _currencies = const [];
+  bool _isReady = false;
+  bool _isSubmitting = false;
+  bool _dependenciesLoaded = false;
 
   WellType get _type => widget.type;
 
-  _Currency get _baseCurrency =>
-      _sampleCurrencies.firstWhere((c) => c.isBase);
+  _Currency? get _baseCurrencyOrNull {
+    for (final c in _currencies) {
+      if (c.isBase) return c;
+    }
+    return null;
+  }
+
+  _Currency get _baseCurrency => _baseCurrencyOrNull!;
 
   @override
   void initState() {
     super.initState();
-    _selected = _baseCurrency;
     _nameCtrl.addListener(_onAnyChange);
     _expectedCtrl.addListener(_onAnyChange);
     _minCtrl.addListener(_onAnyChange);
     _maxCtrl.addListener(_onAnyChange);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_dependenciesLoaded) return;
+    _dependenciesLoaded = true;
+    _loadInitialData();
+  }
+
+  Future<void> _loadInitialData() async {
+    final scope = AppScope.of(context);
+    final settings = await scope.appSettings.watch().first;
+    final baseCode = settings?.baseCurrencyCode ?? 'USD';
+    final activeCycle = await scope.cycles.watchActiveCycle().first;
+    final rates = activeCycle == null
+        ? const <ExchangeRateRow>[]
+        : await scope.cycles.watchRatesFor(activeCycle.id).first;
+    // Pre-cycle: the cycle-scoped table is empty. Fall back to the
+    // disk-backed pending store so non-base wells get a real conversion
+    // factor instead of silently defaulting to 1:1.
+    final Map<String, double> pendingToBase = activeCycle == null
+        ? {
+            for (final e in scope.pendingRates.current.entries)
+              e.key: e.value.rate,
+          }
+        : const {};
+    final currencyRows = await scope.appSettings.watchCurrencies().first;
+
+    if (!mounted) return;
+    setState(() {
+      _currencies =
+          _buildCurrencies(currencyRows, baseCode, rates, pendingToBase);
+      _selected = _baseCurrencyOrNull ??
+          (_currencies.isNotEmpty ? _currencies.first : null);
+      _isReady = _selected != null;
+    });
+  }
+
+  List<_Currency> _buildCurrencies(
+    List<CurrencyRow> rows,
+    String baseCode,
+    List<ExchangeRateRow> rates,
+    Map<String, double> pendingToBase,
+  ) {
+    final Map<String, double> toBase = {
+      for (final r in rates)
+        if (r.toCurrencyCode == baseCode) r.fromCurrencyCode: r.rate,
+    };
+    return [
+      for (final row in rows)
+        if (row.isActive)
+          if (CurrencyCatalog.findByCode(row.code) case final spec?)
+            _Currency(
+              spec: spec,
+              rateToBase: row.code == baseCode
+                  ? 1.0
+                  : (toBase[row.code] ?? pendingToBase[row.code] ?? 1.0),
+              isBase: row.code == baseCode,
+            ),
+    ];
   }
 
   @override
@@ -95,11 +168,13 @@ class _NewWellScreenState extends State<NewWellScreen> {
   // return minor units in THAT currency. Empty / unparseable → 0 so the
   // live header captions stay meaningful as the user types.
   int _toMinor(TextEditingController ctrl) {
+    final selected = _selected;
+    if (selected == null) return 0;
     final raw = ctrl.text.trim();
     if (raw.isEmpty) return 0;
     final asDouble = double.tryParse(raw);
     if (asDouble == null || asDouble < 0) return 0;
-    final num scale = math.pow(10, _selected.decimals);
+    final num scale = math.pow(10, selected.decimals);
     return (asDouble * scale).round();
   }
 
@@ -107,10 +182,12 @@ class _NewWellScreenState extends State<NewWellScreen> {
   // the database.md conversion rule:
   //   sourceMinor * rate * 10^(base.decimals - src.decimals), rounded.
   int _toBase(int sourceMinor) {
-    if (_selected.isBase) return sourceMinor;
+    final selected = _selected;
+    if (selected == null) return sourceMinor;
+    if (selected.isBase) return sourceMinor;
     final num scale =
-        math.pow(10, _baseCurrency.decimals - _selected.decimals);
-    return (sourceMinor * _selected.rateToBase * scale).round();
+        math.pow(10, _baseCurrency.decimals - selected.decimals);
+    return (sourceMinor * selected.rateToBase * scale).round();
   }
 
   int get _expectedMinor => _toMinor(_expectedCtrl);
@@ -127,6 +204,8 @@ class _NewWellScreenState extends State<NewWellScreen> {
       _minMinor > 0 && _maxMinor > 0 && _minMinor > _maxMinor;
 
   bool get _canCreate {
+    if (_isSubmitting) return false;
+    if (!_isReady) return false;
     if (_nameCtrl.text.trim().isEmpty) return false;
     switch (_type) {
       case WellType.foundation:
@@ -140,29 +219,41 @@ class _NewWellScreenState extends State<NewWellScreen> {
     }
   }
 
-  void _onCreate() {
+  Future<void> _onCreate() async {
     if (!_canCreate) return;
-    // Data layer isn't wired yet — pop with a snackbar so the user sees
-    // the gesture landed. Real repository insert comes with the data pass.
-    Navigator.of(context).pop();
-    final kindLabel =
-        _type == WellType.foundation ? 'Foundation' : 'Bonus';
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          '$kindLabel well “${_nameCtrl.text.trim()}” would be created here.',
-          style: const TextStyle(
-            fontFamily: 'Nunito',
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        duration: const Duration(seconds: 2),
-      ),
-    );
+    final selected = _selected!;
+    setState(() => _isSubmitting = true);
+    try {
+      await AppScope.of(context).wells.create(
+            name: _nameCtrl.text.trim(),
+            wellType: _type,
+            currencyCode: selected.code,
+            expectedAmount:
+                _type == WellType.foundation ? _expectedMinor : null,
+            estimateMin: _type == WellType.bonus && _minMinor > 0
+                ? _minMinor
+                : null,
+            estimateMax: _type == WellType.bonus && _maxMinor > 0
+                ? _maxMinor
+                : null,
+          );
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      return;
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isSubmitting = false);
+      CropkeepToast.error(
+        context,
+        title: "Couldn't create well",
+        flavor: '$e',
+        duration: const Duration(seconds: 3),
+      );
+    }
   }
 
   void _onCurrencyChanged(_Currency next) {
-    if (next.code == _selected.code) return;
+    if (next.code == _selected?.code) return;
     setState(() {
       _selected = next;
       // Different currency = different denomination. Carrying "100" from
@@ -176,6 +267,8 @@ class _NewWellScreenState extends State<NewWellScreen> {
   }
 
   Future<void> _openCurrencyPicker() async {
+    final selected = _selected;
+    if (selected == null) return;
     FocusScope.of(context).unfocus();
     final _Currency? picked = await showModalBottomSheet<_Currency>(
       context: context,
@@ -184,8 +277,8 @@ class _NewWellScreenState extends State<NewWellScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (_) => _CurrencyPickerSheet(
-        currencies: _sampleCurrencies,
-        selected: _selected,
+        currencies: _currencies,
+        selected: selected,
       ),
     );
     if (picked != null) _onCurrencyChanged(picked);
@@ -193,6 +286,13 @@ class _NewWellScreenState extends State<NewWellScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_isReady) {
+      return const Scaffold(
+        backgroundColor: CropkeepColors.bgScreen,
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    final selectedCurrency = _selected!;
     return Scaffold(
       backgroundColor: CropkeepColors.bgScreen,
       body: GestureDetector(
@@ -225,7 +325,7 @@ class _NewWellScreenState extends State<NewWellScreen> {
                       const SizedBox(height: 8),
                       _AmountField(
                         controller: _expectedCtrl,
-                        currency: _selected,
+                        currency: selectedCurrency,
                         baseCurrency: _baseCurrency,
                         amountInBase: _expectedInBase,
                         onCurrencyTap: _openCurrencyPicker,
@@ -242,7 +342,7 @@ class _NewWellScreenState extends State<NewWellScreen> {
                       _EstimateRangeFields(
                         minController: _minCtrl,
                         maxController: _maxCtrl,
-                        currency: _selected,
+                        currency: selectedCurrency,
                         baseCurrency: _baseCurrency,
                         minInBase: _minInBase,
                         maxInBase: _maxInBase,
@@ -287,24 +387,6 @@ class _Currency {
   int get decimals => spec.decimalPlaces;
   String get flagAsset => spec.flagAsset;
 }
-
-final List<_Currency> _sampleCurrencies = [
-  _Currency(
-    spec: CurrencyCatalog.findByCode('TWD')!,
-    rateToBase: 1.0,
-    isBase: true,
-  ),
-  _Currency(
-    spec: CurrencyCatalog.findByCode('USD')!,
-    rateToBase: 30.0,
-    isBase: false,
-  ),
-  _Currency(
-    spec: CurrencyCatalog.findByCode('JPY')!,
-    rateToBase: 0.21,
-    isBase: false,
-  ),
-];
 
 // ──────────────────────────────────────────────────────────────────────────
 // Header — same chrome as NewPlotScreen's header (bgHero, 24px bottom

@@ -12,6 +12,8 @@ import '../data/tables/cycles.dart' show CycleState;
 import '../data/tables/wells.dart' show WellType;
 import '../theme/colors.dart';
 import '../theme/plot_swatches.dart';
+import 'cropkeep_toast.dart';
+import 'cycle_rates_sheet.dart';
 
 // ──────────────────────────────────────────────────────────────────────────
 // LogTransactionSheet — the FAB-launched modal that captures every field
@@ -178,12 +180,22 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
     if (raw.isEmpty) return false;
     final parsed = double.tryParse(raw);
     if (parsed == null || parsed <= 0) return false;
+    // Source currency must have a rate (or be base). Without one we'd
+    // silently default to 1:1 conversion.
+    final sourceCode = _currencyCode ?? data.baseCurrency.code;
+    if (data.rateToBase(sourceCode) == null) return false;
     if (_mode == LogTransactionMode.expense) {
       if (_isEmergency) {
         // Emergency always lands on Unplanned — valid even with no chip.
         return data.unplannedPlot != null;
       }
-      return _selectedPlotId != null;
+      if (_selectedPlotId == null) return false;
+      // Plot currency rate must also exist — the plotAmount column needs
+      // it for the base→plot leg of the conversion.
+      final plot = data.plotById(_selectedPlotId!);
+      final plotCode = plot?.currencyCode ?? data.baseCurrency.code;
+      if (data.rateToBase(plotCode) == null) return false;
+      return true;
     } else {
       return _selectedWellId != null;
     }
@@ -202,6 +214,7 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
     if (amountMinor == null || amountMinor <= 0) return;
 
     final rateToBase = data.rateToBase(currencyCode);
+    if (rateToBase == null) return; // _validate already gated this.
     final baseAmountMinor = _convertMinor(
       amountMinor,
       sourceDecimals: currency.decimalPlaces,
@@ -231,11 +244,13 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
         final plotCurrency = plot == null
             ? data.baseCurrency
             : (data.currencyByCode[plot.currencyCode] ?? data.baseCurrency);
+        final plotRate = data.rateToBase(plotCurrency.code);
+        if (plotRate == null) return; // _validate already gated this.
         final plotAmountMinor = _convertMinor(
           baseAmountMinor,
           sourceDecimals: data.baseCurrency.decimalPlaces,
           targetDecimals: plotCurrency.decimalPlaces,
-          rate: 1 / data.rateToBase(plotCurrency.code).clamp(1e-9, 1e9),
+          rate: 1.0 / plotRate,
         );
         await scope.transactions.logExpense(
           plotId: plotId,
@@ -263,19 +278,12 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
       }
       if (!mounted) return;
       Navigator.of(context).pop(true);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            _mode == LogTransactionMode.expense
-                ? 'Expense logged.'
-                : 'Income logged.',
-            style: const TextStyle(
-              fontFamily: 'Nunito',
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          duration: const Duration(seconds: 2),
-        ),
+      CropkeepToast.success(
+        context,
+        title: _mode == LogTransactionMode.expense
+            ? 'Expense logged'
+            : 'Income logged',
+        duration: const Duration(seconds: 2),
       );
     } finally {
       if (mounted) setState(() => _submitting = false);
@@ -317,12 +325,14 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
         ? 0
         : _parseAmountToMinor(amountText, currency.decimalPlaces) ?? 0;
     final rateToBase = data.rateToBase(currency.code);
-    final baseMinor = _convertMinor(
-      amountMinor,
-      sourceDecimals: currency.decimalPlaces,
-      targetDecimals: data.baseCurrency.decimalPlaces,
-      rate: rateToBase,
-    );
+    final baseMinor = (rateToBase == null)
+        ? 0
+        : _convertMinor(
+            amountMinor,
+            sourceDecimals: currency.decimalPlaces,
+            targetDecimals: data.baseCurrency.decimalPlaces,
+            rate: rateToBase,
+          );
     final isExpense = _mode == LogTransactionMode.expense;
     final hasMultiCurrency = data.currencies.length > 1;
     final canSubmit = _validate(data: data) && !_submitting;
@@ -363,19 +373,25 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
                       currency: currency,
                       hasError: _attemptedSubmit && (amountMinor <= 0),
                     ),
-                    if (currency.code != data.baseCurrency.code &&
-                        amountMinor > 0) ...[
+                    if (currency.code != data.baseCurrency.code) ...[
                       const SizedBox(height: 4),
                       Center(
-                        child: Text(
-                          '≈ ${_formatMinor(baseMinor, data.baseCurrency)}',
-                          style: const TextStyle(
-                            fontFamily: 'Nunito',
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            color: CropkeepColors.textSecondary,
-                          ),
-                        ),
+                        child: rateToBase == null
+                            ? _MissingRatePill(code: currency.code)
+                            : Text(
+                                amountMinor > 0
+                                    ? '≈ ${_formatMinor(baseMinor, data.baseCurrency)}'
+                                        ' · 1 ${data.baseCurrency.code}'
+                                        ' = ${_formatPerBase(1.0 / rateToBase)} ${currency.code}'
+                                    : '1 ${data.baseCurrency.code}'
+                                        ' = ${_formatPerBase(1.0 / rateToBase)} ${currency.code}',
+                                style: const TextStyle(
+                                  fontFamily: 'Nunito',
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                  color: CropkeepColors.textSecondary,
+                                ),
+                              ),
                       ),
                     ],
                     const SizedBox(height: 16),
@@ -524,9 +540,13 @@ class _LogSheetData {
     return null;
   }
 
-  double rateToBase(String code) {
+  // Returns null when the currency is a non-base currency with no rate
+  // row in the active cycle. The log sheet treats this as "submit blocked"
+  // rather than silently fabricating a 1.0 fallback (which used to mask
+  // missing-rate bugs end-to-end).
+  double? rateToBase(String code) {
     if (code == baseCurrency.code) return 1.0;
-    return ratesByCode[code] ?? 1.0;
+    return ratesByCode[code];
   }
 }
 
@@ -1662,6 +1682,60 @@ int _convertMinor(
   if (sourceMinor == 0) return 0;
   final num scale = math.pow(10, targetDecimals - sourceDecimals);
   return (sourceMinor * rate * scale).round();
+}
+
+// Display helper for the conversion preview: shows "1 USD = N PHP" where
+// `perBase` is the foreign-per-base value (inverse of the storage rate).
+// Picks a decimal width that keeps small currencies (EUR/GBP) readable
+// without padding huge-magnitude ones (KRW, JPY) with noise.
+String _formatPerBase(double perBase) {
+  if (perBase >= 100) return perBase.toStringAsFixed(2);
+  if (perBase >= 1) return perBase.toStringAsFixed(3);
+  return perBase.toStringAsFixed(5);
+}
+
+// Surface-of-failure for missing-rate state in the conversion preview.
+// We never silently default to 1.0 anymore, so when a non-base currency
+// has no rate row for the active cycle the user gets a clear pill they
+// can tap to open the cycle rates sheet and set one.
+class _MissingRatePill extends StatelessWidget {
+  const _MissingRatePill({required this.code});
+
+  final String code;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFFFDECEC),
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        onTap: () => showModalBottomSheet<bool>(
+          context: context,
+          isScrollControlled: true,
+          backgroundColor: Colors.transparent,
+          builder: (_) => const CycleRatesSheet(),
+        ),
+        borderRadius: BorderRadius.circular(8),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'No rate set for $code · tap to set',
+                style: const TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: CropkeepColors.textRedDeep,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 String _formatMinor(int minor, CurrencyRow currency) {

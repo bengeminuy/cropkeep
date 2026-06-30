@@ -2,7 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../../app_scope.dart';
 import '../../data/repositories/market_repository.dart';
-import '../../theme/colors.dart';
+import '../../widgets/cropkeep_toast.dart';
+import '../../widgets/market/market_hint_banner.dart';
 import '../../widgets/market/market_item_card.dart';
 import 'market_catalog.dart';
 
@@ -24,31 +25,51 @@ class FertilizersCategoryPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Potted Heirloom (900c decoration) shaves 20% off every
+    // fertilizer's effective price. The discount is computed inline
+    // here so the affordability filter, the card UI, and the buy
+    // handler all read the same number.
+    final bool discounted =
+        (ownedQuantities['potted_heirloom'] ?? 0) >= 1;
+    int priceFor(MarketItemSpec spec) =>
+        discounted ? (spec.priceCoins * 80) ~/ 100 : spec.priceCoins;
+
     final visible = affordableOnly
         ? MarketCatalog.fertilizers
-            .where((f) => coinBalance >= f.priceCoins)
+            .where((f) => coinBalance >= priceFor(f))
             .toList()
         : MarketCatalog.fertilizers;
 
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 4, 16, 96),
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 96),
       children: [
-        const _StackingHeader(),
-        const SizedBox(height: 14),
+        const MarketHintBanner(
+          icon: Icons.info_outline_rounded,
+          text: 'Per-plot +% yield boosts stack additively up to +50%. '
+              'Mystic Potion and Buzzing Beehive sit outside the cap.',
+        ),
+        if (discounted) ...[
+          const SizedBox(height: 8),
+          const MarketHintBanner(
+            icon: Icons.local_offer_outlined,
+            text: 'Potted Heirloom is active — fertilizers are 20% off.',
+          ),
+        ],
+        const SizedBox(height: 12),
         for (final spec in visible) ...[
           MarketItemCard(
             name: spec.name,
             iconAsset: spec.iconAsset,
             description: spec.description,
-            priceCoins: spec.priceCoins,
-            canAfford: coinBalance >= spec.priceCoins,
-            coinShort: coinBalance >= spec.priceCoins
+            priceCoins: priceFor(spec),
+            canAfford: coinBalance >= priceFor(spec),
+            coinShort: coinBalance >= priceFor(spec)
                 ? 0
-                : spec.priceCoins - coinBalance,
+                : priceFor(spec) - coinBalance,
             kind: MarketItemKind.consumable,
             stockOrOwned: ownedQuantities[spec.itemId] ?? 0,
-            onBuy: coinBalance >= spec.priceCoins
-                ? () => _purchase(context, spec)
+            onBuy: coinBalance >= priceFor(spec)
+                ? () => _purchase(context, spec, priceFor(spec))
                 : null,
           ),
           const SizedBox(height: 10),
@@ -57,83 +78,35 @@ class FertilizersCategoryPage extends StatelessWidget {
     );
   }
 
-  Future<void> _purchase(BuildContext context, MarketItemSpec spec) async {
+  Future<void> _purchase(
+    BuildContext context,
+    MarketItemSpec spec,
+    int effectivePrice,
+  ) async {
     final market = AppScope.of(context).market;
     try {
       await market.purchase(
         itemId: spec.itemId,
         itemType: spec.itemType,
-        priceCoins: spec.priceCoins,
+        priceCoins: effectivePrice,
         quantityDelta: 1,
         description: 'Bought ${spec.name}',
       );
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            '${spec.name} added',
-            style: const TextStyle(
-              fontFamily: 'Nunito',
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          duration: const Duration(seconds: 2),
-        ),
+      CropkeepToast.success(
+        context,
+        iconAsset: spec.iconAsset,
+        title: spec.name,
+        flavor: 'Stacked in the shed',
       );
-    } on InsufficientCoinsException {
+    } on InsufficientCoinsException catch (e) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Not enough coins.',
-            style: TextStyle(
-              fontFamily: 'Nunito',
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          duration: Duration(seconds: 2),
-        ),
+      CropkeepToast.error(
+        context,
+        icon: Icons.savings_outlined,
+        title: 'Need more coins',
+        flavor: '${e.need - e.have} short for this purchase',
       );
     }
-  }
-}
-
-class _StackingHeader extends StatelessWidget {
-  const _StackingHeader();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-      decoration: BoxDecoration(
-        color: CropkeepColors.bgGoldWash,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: CropkeepColors.borderGoldPill, width: 1),
-      ),
-      child: const Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(
-            Icons.info_outline_rounded,
-            size: 16,
-            color: CropkeepColors.textGoldDeep,
-          ),
-          SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              'Per-plot +% yield boosts stack additively up to +50%. '
-              'Mystic Potion and Buzzing Beehive sit outside the cap.',
-              style: TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: CropkeepColors.textGoldDeep,
-                height: 1.3,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
   }
 }

@@ -9,8 +9,12 @@ import '../app_scope.dart';
 import '../data/currency_catalog.dart';
 import '../data/database.dart';
 import '../data/tables/cycles.dart' show CycleState;
+import '../data/tables/plots.dart' show PlotKind;
 import '../theme/colors.dart';
 import '../theme/plot_swatches.dart';
+import '../widgets/cropkeep_toast.dart';
+import '../widgets/edit_ledger_entry_sheet.dart';
+import '../widgets/ledger_entry_detail_sheet.dart';
 
 // ──────────────────────────────────────────────────────────────────────────
 // LedgerScreen — the calm record-of-truth tab.
@@ -249,6 +253,7 @@ class _BaseCurrencyProvider extends StatelessWidget {
           builder: (context, currencySnap) {
             final currency = currencySnap.data;
             return _BaseCurrencyScope(
+              code: currency?.code ?? code ?? 'USD',
               symbol: currency?.symbol ?? r'$',
               decimals: currency?.decimalPlaces ?? 2,
               child: child,
@@ -262,11 +267,13 @@ class _BaseCurrencyProvider extends StatelessWidget {
 
 class _BaseCurrencyScope extends InheritedWidget {
   const _BaseCurrencyScope({
+    required this.code,
     required this.symbol,
     required this.decimals,
     required super.child,
   });
 
+  final String code;
   final String symbol;
   final int decimals;
 
@@ -282,7 +289,9 @@ class _BaseCurrencyScope extends InheritedWidget {
 
   @override
   bool updateShouldNotify(_BaseCurrencyScope old) =>
-      symbol != old.symbol || decimals != old.decimals;
+      code != old.code ||
+      symbol != old.symbol ||
+      decimals != old.decimals;
 }
 
 Stream<CurrencyRow?> _watchBaseCurrency(AppDatabase db, String? code) {
@@ -305,11 +314,18 @@ abstract class _LedgerEntry {
   String? get currencyCode; // null when matches base
   int get originalAmountMinor;
   int get originalDecimals;
+  // Rate-to-base snapshotted at log time. Used in the detail sheet to
+  // show the user what conversion produced their base amount.
+  double get exchangeRate;
   int? get editedAtMs;
   bool get isExpense;
   bool get isLocked;
   bool get isEmergency;
   int get sourceCycleId;
+  // Display name of the source — plot name (expense) or well name
+  // (income). May be missing if the underlying row has been archived;
+  // the sheet renders an em-dash in that case.
+  String? get sourceName;
 }
 
 class _ExpenseEntry extends _LedgerEntry {
@@ -339,6 +355,8 @@ class _ExpenseEntry extends _LedgerEntry {
   @override
   int get originalAmountMinor => row.amount;
   @override
+  double get exchangeRate => row.exchangeRate;
+  @override
   int? get editedAtMs => row.editedAt;
   @override
   bool get isExpense => true;
@@ -348,6 +366,8 @@ class _ExpenseEntry extends _LedgerEntry {
   bool get isEmergency => row.isEmergency;
   @override
   int get sourceCycleId => row.cycleId;
+  @override
+  String? get sourceName => plot?.name;
 }
 
 class _IncomeEntry extends _LedgerEntry {
@@ -377,6 +397,8 @@ class _IncomeEntry extends _LedgerEntry {
   @override
   int get originalAmountMinor => row.amount;
   @override
+  double get exchangeRate => row.exchangeRate;
+  @override
   int? get editedAtMs => row.editedAt;
   @override
   bool get isExpense => false;
@@ -386,6 +408,8 @@ class _IncomeEntry extends _LedgerEntry {
   bool get isEmergency => false;
   @override
   int get sourceCycleId => row.cycleId;
+  @override
+  String? get sourceName => well?.name;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1835,7 +1859,6 @@ class _LedgerRow extends StatelessWidget {
 
     final tile = InkWell(
       onTap: () => _onTap(context, entry),
-      onLongPress: entry.isLocked ? null : () => _onLongPress(context, entry),
       borderRadius: BorderRadius.circular(14),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
@@ -2054,6 +2077,21 @@ List<InlineSpan> _buildMeta(_LedgerEntry entry) {
     );
     spans.add(TextSpan(text: '${entry.currencyCode} $originalFormatted'));
   }
+  // Investment plots show up in the Ledger alongside every other outflow,
+  // but the user's mental model is different — money put toward a target,
+  // not money spent down. A soft "Contribution" tag (deep-blue tone to
+  // echo bluePremium on the kind picker) lets investment rows surface
+  // pre-attentively in mixed lists without inflating the row chrome.
+  if (entry is _ExpenseEntry && entry.plot?.kind == PlotKind.investment) {
+    appendDot();
+    spans.add(const TextSpan(
+      text: 'Contribution',
+      style: TextStyle(
+        color: CropkeepColors.bluePremium,
+        fontWeight: FontWeight.w700,
+      ),
+    ));
+  }
   if (entry.isLocked) {
     appendDot();
     spans.add(const WidgetSpan(
@@ -2069,9 +2107,18 @@ List<InlineSpan> _buildMeta(_LedgerEntry entry) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Interactions — tap (placeholder edit) and long-press (action sheet).
+// Interactions — tap opens the read-only detail sheet; Edit and Remove
+// both live behind the ⋮ in the detail sheet's header. Long-press is
+// intentionally NOT wired: a swipe-and-mash gesture is the wrong entry
+// point for either a traceable edit or a soft-delete, and routing both
+// actions through tap → ⋮ forces a moment of deliberate intent that
+// matches the plot-breakdown pattern.
 
 void _onTap(BuildContext context, _LedgerEntry entry) {
+  // System-generated rows (Carryover income) get a dedicated dialog
+  // explaining why they can't be touched. Normal entries hand both
+  // Edit and Remove callbacks to the detail sheet, which routes them
+  // through its ⋮ overflow.
   if (entry.isLocked) {
     showDialog<void>(
       context: context,
@@ -2079,35 +2126,48 @@ void _onTap(BuildContext context, _LedgerEntry entry) {
     );
     return;
   }
-  // Edit sheet ships once LogTransactionSheet has its full implementation.
-  // Until then, surface a calm placeholder so the gesture lands.
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(
-      content: Text(
-        'Editing transactions arrives in the next pass.',
-        style: const TextStyle(
-          fontFamily: 'Nunito',
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      duration: const Duration(seconds: 2),
+  final base = _BaseCurrencyScope.of(context);
+  showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => LedgerEntryDetailSheet(
+      isExpense: entry.isExpense,
+      isEmergency: entry.isEmergency,
+      sourceName: entry.sourceName,
+      baseAmountMinor: entry.baseAmountMinor,
+      baseCode: base.code,
+      baseSymbol: base.symbol,
+      baseDecimals: base.decimals,
+      originalAmountMinor: entry.originalAmountMinor,
+      originalCurrencyCode: entry.currencyCode,
+      originalDecimals: entry.originalDecimals,
+      exchangeRate: entry.exchangeRate,
+      whenLogged: entry.when,
+      note: entry.note,
+      editedAt: entry.editedAtMs == null
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(entry.editedAtMs!),
+      isLocked: entry.isLocked,
+      // The detail sheet pops itself before dispatching, so the edit
+      // form and the soft-delete snackbar land on the screen context
+      // — not stacked on top of the detail modal.
+      onEdit: () => _launchEdit(context, entry),
+      onRemove: () => _softDelete(context, entry),
     ),
   );
 }
 
-Future<void> _onLongPress(BuildContext context, _LedgerEntry entry) async {
-  final action = await showModalBottomSheet<String>(
+void _launchEdit(BuildContext context, _LedgerEntry entry) {
+  showModalBottomSheet<bool>(
     context: context,
-    backgroundColor: Colors.transparent,
     isScrollControlled: true,
-    builder: (_) => _RowActionSheet(entry: entry),
+    backgroundColor: Colors.transparent,
+    builder: (_) => EditLedgerEntrySheet(
+      entryId: entry.id,
+      isExpense: entry.isExpense,
+    ),
   );
-  if (!context.mounted) return;
-  if (action == 'delete') {
-    await _softDelete(context, entry);
-  } else if (action == 'edit') {
-    _onTap(context, entry);
-  }
 }
 
 Future<void> _softDelete(BuildContext context, _LedgerEntry entry) async {
@@ -2118,141 +2178,20 @@ Future<void> _softDelete(BuildContext context, _LedgerEntry entry) async {
     await scope.incomeEntries.softDelete(entry.id);
   }
   if (!context.mounted) return;
-  final messenger = ScaffoldMessenger.of(context);
-  messenger.hideCurrentSnackBar();
-  messenger.showSnackBar(
-    SnackBar(
-      content: Text(
-        entry.isExpense ? 'Transaction removed.' : 'Income entry removed.',
-        style: const TextStyle(
-          fontFamily: 'Nunito',
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      duration: const Duration(seconds: 4),
-      action: SnackBarAction(
-        label: 'Undo',
-        textColor: CropkeepColors.greenLight,
-        onPressed: () async {
-          if (entry.isExpense) {
-            await scope.transactions.restore(entry.id);
-          } else {
-            await scope.incomeEntries.restore(entry.id);
-          }
-        },
-      ),
+  CropkeepToast.info(
+    context,
+    title: entry.isExpense ? 'Transaction removed' : 'Income entry removed',
+    action: ToastAction(
+      label: 'Undo',
+      onPressed: () async {
+        if (entry.isExpense) {
+          await scope.transactions.restore(entry.id);
+        } else {
+          await scope.incomeEntries.restore(entry.id);
+        }
+      },
     ),
   );
-}
-
-class _RowActionSheet extends StatelessWidget {
-  const _RowActionSheet({required this.entry});
-  final _LedgerEntry entry;
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      top: false,
-      child: Container(
-        margin: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: CropkeepColors.borderCard),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 8),
-            Container(
-              width: 44,
-              height: 4,
-              decoration: BoxDecoration(
-                color: CropkeepColors.borderDivider,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const SizedBox(height: 8),
-            _ActionRow(
-              icon: Icons.edit_outlined,
-              label: 'Edit',
-              onTap: () => Navigator.of(context).pop('edit'),
-            ),
-            const Divider(
-              height: 1,
-              thickness: 1,
-              indent: 16,
-              endIndent: 16,
-              color: CropkeepColors.borderDivider,
-            ),
-            _ActionRow(
-              icon: Icons.delete_outline_rounded,
-              label: entry.isExpense
-                  ? 'Remove this transaction'
-                  : 'Remove this income entry',
-              destructive: true,
-              onTap: () => Navigator.of(context).pop('delete'),
-            ),
-            const Divider(
-              height: 1,
-              thickness: 1,
-              indent: 16,
-              endIndent: 16,
-              color: CropkeepColors.borderDivider,
-            ),
-            _ActionRow(
-              icon: Icons.close_rounded,
-              label: 'Cancel',
-              onTap: () => Navigator.of(context).pop(),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _ActionRow extends StatelessWidget {
-  const _ActionRow({
-    required this.icon,
-    required this.label,
-    required this.onTap,
-    this.destructive = false,
-  });
-
-  final IconData icon;
-  final String label;
-  final VoidCallback onTap;
-  final bool destructive;
-
-  @override
-  Widget build(BuildContext context) {
-    final color = destructive
-        ? CropkeepColors.textRedDeep
-        : CropkeepColors.textPrimary;
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-        child: Row(
-          children: [
-            Icon(icon, size: 20, color: color),
-            const SizedBox(width: 14),
-            Text(
-              label,
-              style: TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
-                color: color,
-                height: 1,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 class _LockedEntryDialog extends StatelessWidget {

@@ -4,11 +4,15 @@ import 'package:flutter_svg/flutter_svg.dart';
 import '../../theme/colors.dart';
 
 // Generic row card used by Fertilizers, Decorations, and Avatars.
-// Differs from CropMarketCard in three ways:
+// Differs from CropMarketCard in two ways:
 //   • Effect text replaces tier / stock economics
-//   • Optional payback line (Decorations only)
-//   • Three terminal states: Buy (affordable, not owned), "Need N more",
-//     Owned (one-time items) / Stock N (consumables).
+//   • Three terminal states: Buy (affordable, not owned), "Need N more"
+//     plain text, Owned chip (one-time items)
+//
+// Consumables (fertilizers) always surface a stock chip in the top-right
+// of the name row — neutral-grey when zero, green when held — so the
+// player can see "I have none of these" at a glance instead of having
+// to remember. Matches the chip idiom on CropMarketCard.
 class MarketItemCard extends StatelessWidget {
   const MarketItemCard({
     super.key,
@@ -20,8 +24,8 @@ class MarketItemCard extends StatelessWidget {
     required this.coinShort,
     required this.kind,
     required this.stockOrOwned,
-    this.payback,
     this.onBuy,
+    this.previewOnly = false,
   });
 
   final String name;
@@ -31,14 +35,18 @@ class MarketItemCard extends StatelessWidget {
   final bool canAfford;
   final int coinShort;
   final MarketItemKind kind;
-  // For consumables: current stock count (rendered as "Stock N").
+  // For consumables: current stock count (rendered as a stock badge).
   // For one-time items: 0 if not owned, ≥1 if owned.
   final int stockOrOwned;
-  final String? payback;
   final VoidCallback? onBuy;
+  // Used by the one-time-item PurchaseConfirmSheet: drop the Buy/Need
+  // terminal so the card reads as a preview of what you're about to
+  // own, not another action surface inside the modal.
+  final bool previewOnly;
 
   bool get _isOwned =>
       kind == MarketItemKind.oneTime && stockOrOwned > 0;
+  bool get _isConsumable => kind == MarketItemKind.consumable;
 
   @override
   Widget build(BuildContext context) {
@@ -72,40 +80,38 @@ class MarketItemCard extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
-                  name,
-                  style: const TextStyle(
-                    fontFamily: 'Nunito',
-                    fontSize: 15,
-                    fontWeight: FontWeight.w800,
-                    color: CropkeepColors.textPrimary,
-                    height: 1.1,
-                  ),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        name,
+                        style: const TextStyle(
+                          fontFamily: 'Nunito',
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                          color: CropkeepColors.textPrimary,
+                          height: 1.1,
+                        ),
+                      ),
+                    ),
+                    if (_isConsumable) ...[
+                      const SizedBox(width: 8),
+                      _StockChip(stock: stockOrOwned),
+                    ],
+                  ],
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: 5),
                 Text(
                   description,
                   style: const TextStyle(
                     fontFamily: 'Nunito',
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
-                    color: CropkeepColors.textSecondary,
-                    height: 1.3,
+                    color: CropkeepColors.textPrimary,
+                    height: 1.35,
                   ),
                 ),
-                if (payback != null) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    'Payback · ${payback!}',
-                    style: const TextStyle(
-                      fontFamily: 'Nunito',
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      color: CropkeepColors.textGoldDeep,
-                      height: 1.2,
-                    ),
-                  ),
-                ],
                 const SizedBox(height: 10),
                 const Divider(
                   height: 1,
@@ -117,14 +123,14 @@ class MarketItemCard extends StatelessWidget {
                   children: [
                     _PriceLabel(priceCoins: priceCoins, free: priceCoins == 0),
                     const Spacer(),
-                    _StateChip(
-                      kind: kind,
-                      isOwned: _isOwned,
-                      canAfford: canAfford,
-                      coinShort: coinShort,
-                      stock: stockOrOwned,
-                      onBuy: onBuy,
-                    ),
+                    if (!previewOnly)
+                      _Terminal(
+                        kind: kind,
+                        isOwned: _isOwned,
+                        canAfford: canAfford,
+                        coinShort: coinShort,
+                        onBuy: onBuy,
+                      ),
                   ],
                 ),
               ],
@@ -137,6 +143,49 @@ class MarketItemCard extends StatelessWidget {
 }
 
 enum MarketItemKind { consumable, oneTime }
+
+// Mirror of CropMarketCard._StockChip so consumable cards across the
+// Market read as the same idiom. Neutral grey at zero, green at ≥1.
+class _StockChip extends StatelessWidget {
+  const _StockChip({required this.stock});
+
+  final int stock;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool empty = stock == 0;
+    final Color bg = empty
+        ? CropkeepColors.borderDivider
+        : CropkeepColors.greenHint;
+    final Color fg = empty
+        ? CropkeepColors.textSecondary
+        : CropkeepColors.textGreenDeep;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.inventory_2_outlined, size: 12, color: fg),
+          const SizedBox(width: 5),
+          Text(
+            '$stock',
+            style: TextStyle(
+              fontFamily: 'Nunito',
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+              color: fg,
+              height: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class _PriceLabel extends StatelessWidget {
   const _PriceLabel({required this.priceCoins, required this.free});
@@ -178,13 +227,12 @@ class _PriceLabel extends StatelessWidget {
   }
 }
 
-class _StateChip extends StatelessWidget {
-  const _StateChip({
+class _Terminal extends StatelessWidget {
+  const _Terminal({
     required this.kind,
     required this.isOwned,
     required this.canAfford,
     required this.coinShort,
-    required this.stock,
     required this.onBuy,
   });
 
@@ -192,12 +240,10 @@ class _StateChip extends StatelessWidget {
   final bool isOwned;
   final bool canAfford;
   final int coinShort;
-  final int stock;
   final VoidCallback? onBuy;
 
   @override
   Widget build(BuildContext context) {
-    // One-time items that are already owned
     if (kind == MarketItemKind.oneTime && isOwned) {
       return Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
@@ -230,75 +276,40 @@ class _StateChip extends StatelessWidget {
       );
     }
 
-    // Consumables — show the stock count alongside the Buy CTA
-    final Widget stockChip = kind == MarketItemKind.consumable
-        ? Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: Text(
-              'stock $stock',
-              style: const TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-                color: CropkeepColors.textGreenDeep,
-                height: 1,
-              ),
-            ),
-          )
-        : const SizedBox.shrink();
-
     if (!canAfford) {
-      return Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          stockChip,
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: CropkeepColors.bgHero,
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Text(
-              'Need $coinShort',
-              style: const TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                color: CropkeepColors.textSecondaryOnHero,
-                height: 1,
-              ),
-            ),
-          ),
-        ],
+      // Plain text — no rectangular bg, doesn't read as a button.
+      return Text(
+        'Need $coinShort more',
+        style: const TextStyle(
+          fontFamily: 'Nunito',
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+          color: CropkeepColors.textSecondary,
+          height: 1,
+        ),
       );
     }
 
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        stockChip,
-        GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: onBuy,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              color: CropkeepColors.greenPrimary,
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: const Text(
-              'Buy',
-              style: TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 13,
-                fontWeight: FontWeight.w800,
-                color: CropkeepColors.textOnGreenBtn,
-                height: 1,
-              ),
-            ),
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onBuy,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          color: CropkeepColors.greenPrimary,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: const Text(
+          'Buy',
+          style: TextStyle(
+            fontFamily: 'Nunito',
+            fontSize: 13,
+            fontWeight: FontWeight.w800,
+            color: CropkeepColors.textOnGreenBtn,
+            height: 1,
           ),
         ),
-      ],
+      ),
     );
   }
 }

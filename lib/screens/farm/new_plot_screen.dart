@@ -4,8 +4,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import '../../app_scope.dart';
 import '../../data/currency_catalog.dart';
+import '../../data/database.dart' show CurrencyRow, ExchangeRateRow, PlotRow;
+import '../../data/repositories/market_repository.dart' show CropPickerEntry;
+import '../../data/tables/plots.dart' show PlotKind;
 import '../../theme/colors.dart';
+import '../../widgets/cropkeep_toast.dart';
 
 // ──────────────────────────────────────────────────────────────────────────
 // NewPlotScreen — plot creation flow.
@@ -26,6 +31,8 @@ class NewPlotScreen extends StatefulWidget {
     super.key,
     required this.reservoirTotal,
     required this.allocatedSoFar,
+    this.existingPlot,
+    this.canEditFinancials = true,
   });
 
   // Total foundation income for the active cycle, in base minor units.
@@ -34,14 +41,29 @@ class NewPlotScreen extends StatefulWidget {
   final int reservoirTotal;
   // Sum of every existing non-Unplanned plot budget this cycle, already
   // converted to base minor units. The new plot's base-equivalent budget
-  // is added to this and compared against `reservoirTotal`.
+  // is added to this and compared against `reservoirTotal`. In edit mode
+  // the screen subtracts the existing plot's own contribution before
+  // rendering the allocation bar, so callers always pass the same
+  // "everything currently allocated" number whether new or edit.
   final int allocatedSoFar;
+  // Edit mode: when non-null, the form hydrates from this row and the
+  // submit handler calls PlotRepository.update instead of .create.
+  // The screen pops with `true` on save so callers can decide whether
+  // to refresh stale snapshots upstream.
+  final PlotRow? existingPlot;
+  // False when the plot has live transactions this cycle. Locks the
+  // kind toggle + budget field (changing kind or budget mid-cycle would
+  // re-interpret already-logged transactions under different math).
+  // The other fields (name, crop, color, due day) stay editable.
+  final bool canEditFinancials;
+
+  bool get isEditing => existingPlot != null;
 
   @override
   State<NewPlotScreen> createState() => _NewPlotScreenState();
 }
 
-enum _PlotKind { discretionary, fixedObligation }
+enum _PlotKind { discretionary, fixedObligation, investment }
 
 // `_dueDay` holds a raw day-of-month (1–31). Months shorter than the
 // chosen day are clamped at evaluation time — picking 31 for a Feb
@@ -79,16 +101,14 @@ const int _defaultPlotColorIndex = 5;
 
 // The crop catalog the user picks from when creating a plot. Mirrors the
 // `crops_catalog` table in database.md: three permanent starters (free
-// at onboarding) plus fifteen consumable seed packs whose `quantity`
-// in `owned_items` ticks down each cycle.
+// at onboarding) plus consumable seed packs whose `quantity` in
+// `owned_items` ticks down each cycle.
 //
 // `stock` is null for starters (permanent unlocks, no inventory concept)
 // and an int for seed packs (current `owned_items.quantity`). A stock
 // of 0 means the user is out of seeds — the tile is still rendered (so
 // the user knows the crop exists) but tapping fires a Market prompt
-// instead of selecting. Until the real owned_items query lands, the
-// numbers below are mock distribution: some healthy, some low, some
-// empty — exactly the range the spec implies the user encounters.
+// instead of selecting.
 typedef _CropOption = ({
   String id,
   String name,
@@ -97,162 +117,202 @@ typedef _CropOption = ({
   int? stock,
 });
 
-const List<_CropOption> _cropOptions = [
-  // Starters — order matches the spec (wheat is the auto-revert fallback).
-  (
-    id: 'wheat',
-    name: 'Wheat',
-    iconAsset: 'assets/icons/crops/wheat.svg',
-    isStarter: true,
-    stock: null,
-  ),
-  (
-    id: 'apple',
-    name: 'Apple',
-    iconAsset: 'assets/icons/crops/apple.svg',
-    isStarter: true,
-    stock: null,
-  ),
-  (
-    id: 'potato',
-    name: 'Potato',
-    iconAsset: 'assets/icons/crops/potato.svg',
-    isStarter: true,
-    stock: null,
-  ),
-  // Seed packs — 15 alphabetical. "Pepper" rather than "Bell pepper"
-  // because the longer name overflows the 60px tile column; the icon
-  // carries the bell-pepper identity unambiguously.
-  (
-    id: 'barley',
-    name: 'Barley',
-    iconAsset: 'assets/icons/crops/icons8-barley.svg',
-    isStarter: false,
-    stock: 0,
-  ),
-  (
-    id: 'blueberry',
-    name: 'Blueberry',
-    iconAsset: 'assets/icons/crops/icons8-blueberry.svg',
-    isStarter: false,
-    stock: 3,
-  ),
-  (
-    id: 'carrot',
-    name: 'Carrot',
-    iconAsset: 'assets/icons/crops/icons8-carrot.svg',
-    isStarter: false,
-    stock: 1,
-  ),
-  (
-    id: 'corn',
-    name: 'Corn',
-    iconAsset: 'assets/icons/crops/icons8-corn.svg',
-    isStarter: false,
-    stock: 0,
-  ),
-  (
-    id: 'eggplant',
-    name: 'Eggplant',
-    iconAsset: 'assets/icons/crops/icons8-eggplant.svg',
-    isStarter: false,
-    stock: 2,
-  ),
-  (
-    id: 'lettuce',
-    name: 'Lettuce',
-    iconAsset: 'assets/icons/crops/icons8-lettuce.svg',
-    isStarter: false,
-    stock: 4,
-  ),
-  (
-    id: 'mango',
-    name: 'Mango',
-    iconAsset: 'assets/icons/crops/icons8-mango.svg',
-    isStarter: false,
-    stock: 0,
-  ),
-  (
-    id: 'orange',
-    name: 'Orange',
-    iconAsset: 'assets/icons/crops/icons8-orange.svg',
-    isStarter: false,
-    stock: 5,
-  ),
-  (
-    id: 'peach',
-    name: 'Peach',
-    iconAsset: 'assets/icons/crops/icons8-peach.svg',
-    isStarter: false,
-    stock: 0,
-  ),
-  (
-    id: 'pear',
-    name: 'Pear',
-    iconAsset: 'assets/icons/crops/icons8-pear.svg',
-    isStarter: false,
-    stock: 2,
-  ),
-  (
-    id: 'bell_pepper',
-    name: 'Pepper',
-    iconAsset: 'assets/icons/crops/icons8-bell-pepper.svg',
-    isStarter: false,
-    stock: 1,
-  ),
-  (
-    id: 'pineapple',
-    name: 'Pineapple',
-    iconAsset: 'assets/icons/crops/icons8-pineapple.svg',
-    isStarter: false,
-    stock: 0,
-  ),
-  (
-    id: 'raspberry',
-    name: 'Raspberry',
-    iconAsset: 'assets/icons/crops/icons8-raspberry.svg',
-    isStarter: false,
-    stock: 3,
-  ),
-  (
-    id: 'strawberry',
-    name: 'Strawberry',
-    iconAsset: 'assets/icons/crops/icons8-strawberry.svg',
-    isStarter: false,
-    stock: 7,
-  ),
-  (
-    id: 'tomato',
-    name: 'Tomato',
-    iconAsset: 'assets/icons/crops/icons8-tomato.svg',
-    isStarter: false,
-    stock: 5,
-  ),
-];
+// Maps a crops_catalog row to the asset path the picker tile renders.
+// Starters use the plain SVG name; consumable seed packs use the
+// `icons8-` prefix with underscores swapped to hyphens. Centralised
+// here so any future asset rename only touches one file.
+String _cropIconAsset(String cropId, {required bool isStarter}) {
+  if (isStarter) return 'assets/icons/crops/$cropId.svg';
+  final dashed = cropId.replaceAll('_', '-');
+  return 'assets/icons/crops/icons8-$dashed.svg';
+}
 
-// Wheat is the spec's fallback crop ("auto-reverts to wheat" when an
-// owned consumable runs out), so it doubles as the default selection
-// for a fresh plot.
-const int _defaultCropIndex = 0;
+// Builds the picker option list off live catalog + ownership state.
+// Filters out the `unplanned` catalog entry — it's the wildflower
+// fallback for the system-managed Unplanned plot, never a real
+// user-pickable crop.
+List<_CropOption> _cropOptionsFromEntries(List<CropPickerEntry> entries) {
+  return [
+    for (final e in entries)
+      if (e.crop.cropId != 'unplanned')
+        (
+          id: e.crop.cropId,
+          name: e.crop.name,
+          iconAsset: _cropIconAsset(e.crop.cropId, isStarter: e.crop.isStarter),
+          isStarter: e.crop.isStarter,
+          stock: e.stock,
+        ),
+  ];
+}
 
 class _NewPlotScreenState extends State<NewPlotScreen> {
   final TextEditingController _nameCtrl = TextEditingController();
   final TextEditingController _amountCtrl = TextEditingController();
   _PlotKind _kind = _PlotKind.discretionary;
   int? _dueDay;
-  late _Currency _selected;
+  _Currency? _selected;
   _PlotColor _selectedColor = _plotColors[_defaultPlotColorIndex];
-  _CropOption _selectedCrop = _cropOptions[_defaultCropIndex];
+  _CropOption? _selectedCrop;
 
-  _Currency get _baseCurrency =>
-      _sampleCurrencies.firstWhere((c) => c.isBase);
+  // Resolved on first didChangeDependencies via AppScope. Until both
+  // lists arrive the screen renders a loading scaffold so the form
+  // never reads a null selected currency / crop. Subsequent rebuilds
+  // (currency added in Settings, seed pack bought in Market mid-flow)
+  // reconcile via _reconcileSelections.
+  List<_Currency> _currencies = const [];
+  List<_CropOption> _cropOptions = const [];
+  bool _isReady = false;
+  bool _isSubmitting = false;
+
+  _Currency? get _baseCurrencyOrNull {
+    for (final c in _currencies) {
+      if (c.isBase) return c;
+    }
+    return null;
+  }
+
+  // Throwing fallback: only call after _isReady is true. Used by the
+  // header / formatter helpers that always run inside a ready frame.
+  _Currency get _baseCurrency => _baseCurrencyOrNull!;
 
   @override
   void initState() {
     super.initState();
-    _selected = _baseCurrency;
     _nameCtrl.addListener(_onAnyChange);
     _amountCtrl.addListener(_onAnyChange);
+  }
+
+  bool _dependenciesLoaded = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_dependenciesLoaded) return;
+    _dependenciesLoaded = true;
+    _loadInitialData();
+  }
+
+  Future<void> _loadInitialData() async {
+    final scope = AppScope.of(context);
+    final settings = await scope.appSettings.watch().first;
+    final baseCode = settings?.baseCurrencyCode ?? 'USD';
+    final activeCycle = await scope.cycles.watchActiveCycle().first;
+    final rates = activeCycle == null
+        ? const <ExchangeRateRow>[]
+        : await scope.cycles.watchRatesFor(activeCycle.id).first;
+    final Map<String, double> pendingToBase = activeCycle == null
+        ? {
+            for (final e in scope.pendingRates.current.entries)
+              e.key: e.value.rate,
+          }
+        : const {};
+    final currencyRows = await scope.appSettings.watchCurrencies().first;
+    final cropEntries = await scope.market.watchCropPicker().first;
+
+    if (!mounted) return;
+    setState(() {
+      _currencies =
+          _buildCurrencies(currencyRows, baseCode, rates, pendingToBase);
+      _cropOptions = _cropOptionsFromEntries(cropEntries);
+      _selected = _baseCurrencyOrNull ??
+          (_currencies.isNotEmpty ? _currencies.first : null);
+      _selectedCrop = _cropOptions.isEmpty
+          ? null
+          : _cropOptions.firstWhere(
+              (c) => c.id == 'wheat',
+              orElse: () => _cropOptions.first,
+            );
+      _hydrateFromExisting();
+      _isReady = _selected != null && _selectedCrop != null;
+    });
+  }
+
+  // Edit-mode initial fill. Runs once inside _loadInitialData, after the
+  // currency + crop lists are populated so the existing plot's currency
+  // and crop can resolve to the same instances the pickers use. Falls
+  // back to base / first option when a referenced id has since been
+  // removed (e.g. the user disabled the currency, or the crop pack
+  // sold out from inventory) so the form never lands in a broken state.
+  void _hydrateFromExisting() {
+    final PlotRow? edit = widget.existingPlot;
+    if (edit == null) return;
+    _nameCtrl.text = edit.name;
+    _kind = _fromRepoKind(edit.kind);
+    _dueDay = edit.dueDay;
+    if (edit.budgetAmount != null) {
+      final _Currency cur = _currencies.firstWhere(
+        (c) => c.code == edit.currencyCode,
+        orElse: () => _selected ?? _currencies.first,
+      );
+      _selected = cur;
+      _amountCtrl.text = _formatAmountForEdit(edit.budgetAmount!, cur);
+    }
+    if (edit.plotColorId != null) {
+      for (final color in _plotColors) {
+        if (color.name == edit.plotColorId) {
+          _selectedColor = color;
+          break;
+        }
+      }
+    }
+    if (_cropOptions.isNotEmpty) {
+      _selectedCrop = _cropOptions.firstWhere(
+        (c) => c.id == edit.cropTypeId,
+        orElse: () => _selectedCrop ?? _cropOptions.first,
+      );
+    }
+  }
+
+  _PlotKind _fromRepoKind(PlotKind kind) {
+    switch (kind) {
+      case PlotKind.discretionary:
+        return _PlotKind.discretionary;
+      case PlotKind.fixedObligation:
+        return _PlotKind.fixedObligation;
+      case PlotKind.investment:
+        return _PlotKind.investment;
+    }
+  }
+
+  // Minor units → "1234.56" style decimal string that round-trips
+  // through this screen's _budgetMinor parser. JPY-style zero-decimal
+  // currencies drop the dot entirely.
+  String _formatAmountForEdit(int minor, _Currency cur) {
+    if (cur.decimals == 0) return minor.toString();
+    final num scale = math.pow(10, cur.decimals);
+    final int divisor = scale.toInt();
+    final int whole = minor ~/ divisor;
+    final String frac =
+        (minor % divisor).toString().padLeft(cur.decimals, '0');
+    return '$whole.$frac';
+  }
+
+  List<_Currency> _buildCurrencies(
+    List<CurrencyRow> rows,
+    String baseCode,
+    List<ExchangeRateRow> rates,
+    Map<String, double> pendingToBase,
+  ) {
+    // Build a code → rate map keyed on `from_currency_code` for rates
+    // converting INTO the base. Pre-cycle, fall back to the pending
+    // store; only then default to 1.0 so a non-base plot picked before
+    // any rate is entered still renders without dividing by zero.
+    final Map<String, double> toBase = {
+      for (final r in rates)
+        if (r.toCurrencyCode == baseCode) r.fromCurrencyCode: r.rate,
+    };
+    return [
+      for (final row in rows)
+        if (row.isActive)
+          if (CurrencyCatalog.findByCode(row.code) case final spec?)
+            _Currency(
+              spec: spec,
+              rateToBase: row.code == baseCode
+                  ? 1.0
+                  : (toBase[row.code] ?? pendingToBase[row.code] ?? 1.0),
+              isBase: row.code == baseCode,
+            ),
+    ];
   }
 
   @override
@@ -268,11 +328,13 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
   // minor units in THAT currency. Empty / unparseable → 0 so the live
   // pressure caption stays meaningful as the user types.
   int get _budgetMinor {
+    final selected = _selected;
+    if (selected == null) return 0;
     final raw = _amountCtrl.text.trim();
     if (raw.isEmpty) return 0;
     final asDouble = double.tryParse(raw);
     if (asDouble == null || asDouble < 0) return 0;
-    final num scale = math.pow(10, _selected.decimals);
+    final num scale = math.pow(10, selected.decimals);
     return (asDouble * scale).round();
   }
 
@@ -281,17 +343,47 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
   // database.md spec: `sourceMinor * rate * 10^(base.decimals - src.decimals)`,
   // rounded to nearest base minor.
   int get _budgetInBase {
-    if (_selected.isBase) return _budgetMinor;
+    final selected = _selected;
+    if (selected == null) return _budgetMinor;
+    if (selected.isBase) return _budgetMinor;
     final num scale =
-        math.pow(10, _baseCurrency.decimals - _selected.decimals);
-    return (_budgetMinor * _selected.rateToBase * scale).round();
+        math.pow(10, _baseCurrency.decimals - selected.decimals);
+    return (_budgetMinor * selected.rateToBase * scale).round();
   }
 
-  int get _freeBefore => widget.reservoirTotal - widget.allocatedSoFar;
+  // In edit mode, allocatedSoFar from the caller still includes THIS
+  // plot's existing contribution. Subtract it (converted at current rates,
+  // same as the caller used) so the header reads "everything else
+  // allocated + this plot's NEW claim" with no double-count.
+  int get _effectiveAllocatedSoFar {
+    final PlotRow? edit = widget.existingPlot;
+    if (edit == null || edit.budgetAmount == null) {
+      return widget.allocatedSoFar;
+    }
+    final _Currency? cur = _currencyFor(edit.currencyCode);
+    if (cur == null) return widget.allocatedSoFar;
+    final num scale =
+        math.pow(10, _baseCurrency.decimals - cur.decimals);
+    final int existingInBase =
+        (edit.budgetAmount! * cur.rateToBase * scale).round();
+    final int adjusted = widget.allocatedSoFar - existingInBase;
+    return adjusted < 0 ? 0 : adjusted;
+  }
+
+  _Currency? _currencyFor(String code) {
+    for (final c in _currencies) {
+      if (c.code == code) return c;
+    }
+    return null;
+  }
+
+  int get _freeBefore => widget.reservoirTotal - _effectiveAllocatedSoFar;
   int get _freeAfter => _freeBefore - _budgetInBase;
   bool get _exceedsReservoir => _freeAfter < 0;
 
   bool get _canCreate {
+    if (_isSubmitting) return false;
+    if (!_isReady) return false;
     if (_nameCtrl.text.trim().isEmpty) return false;
     if (_budgetMinor <= 0) return false;
     if (_exceedsReservoir) return false;
@@ -299,27 +391,70 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
     return true;
   }
 
-  void _onCreate() {
+  Future<void> _onCreate() async {
     if (!_canCreate) return;
-    // Data layer isn't wired yet — pop with a snackbar so the user sees
-    // the gesture landed. Real repository insert comes with the data pass.
-    Navigator.of(context).pop();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          'Plot “${_nameCtrl.text.trim()}” would be created here.',
-          style: const TextStyle(
-            fontFamily: 'Nunito',
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        duration: const Duration(seconds: 2),
-      ),
-    );
+    final selected = _selected!;
+    final crop = _selectedCrop!;
+    final PlotRow? edit = widget.existingPlot;
+    setState(() => _isSubmitting = true);
+    try {
+      final scope = AppScope.of(context);
+      if (edit != null) {
+        // Locked-financials path: re-supply the existing kind/budget/
+        // currency unchanged. The form fields render disabled in this
+        // mode but their state may not match the row exactly (e.g. if
+        // currency catalog changed), so authoritative values come from
+        // the row itself.
+        final bool financialsEditable = widget.canEditFinancials;
+        await scope.plots.update(
+          id: edit.id,
+          name: _nameCtrl.text.trim(),
+          kind: financialsEditable ? _toRepoKind(_kind) : edit.kind,
+          budgetAmountMinor:
+              financialsEditable ? _budgetMinor : (edit.budgetAmount ?? 0),
+          currencyCode:
+              financialsEditable ? selected.code : edit.currencyCode,
+          cropTypeId: crop.id,
+          colorId: _selectedColor.name,
+          dueDay: _resolvedKind(edit) == PlotKind.fixedObligation
+              ? _dueDay
+              : null,
+        );
+      } else {
+        await scope.plots.create(
+          name: _nameCtrl.text.trim(),
+          kind: _toRepoKind(_kind),
+          budgetAmountMinor: _budgetMinor,
+          currencyCode: selected.code,
+          cropTypeId: crop.id,
+          colorId: _selectedColor.name,
+          dueDay: _kind == _PlotKind.fixedObligation ? _dueDay : null,
+        );
+      }
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isSubmitting = false);
+      CropkeepToast.error(
+        context,
+        title: edit != null ? "Couldn't save plot" : "Couldn't create plot",
+        flavor: '$e',
+        duration: const Duration(seconds: 3),
+      );
+    }
+  }
+
+  // Effective kind after submit: in edit mode with locked financials the
+  // kind toggle is dormant, so the kind stays whatever the row already
+  // had (we still respect "fixed-obligation needs a due day" against the
+  // row's kind, not the toggle state).
+  PlotKind _resolvedKind(PlotRow edit) {
+    return widget.canEditFinancials ? _toRepoKind(_kind) : edit.kind;
   }
 
   void _onCurrencyChanged(_Currency next) {
-    if (next.code == _selected.code) return;
+    if (next.code == _selected?.code) return;
     setState(() {
       _selected = next;
       // Different currency = different denomination. Carrying "100" from
@@ -329,7 +464,20 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
     });
   }
 
+  PlotKind _toRepoKind(_PlotKind kind) {
+    switch (kind) {
+      case _PlotKind.discretionary:
+        return PlotKind.discretionary;
+      case _PlotKind.fixedObligation:
+        return PlotKind.fixedObligation;
+      case _PlotKind.investment:
+        return PlotKind.investment;
+    }
+  }
+
   Future<void> _openCurrencyPicker() async {
+    final selected = _selected;
+    if (selected == null) return;
     FocusScope.of(context).unfocus();
     final _Currency? picked = await showModalBottomSheet<_Currency>(
       context: context,
@@ -338,11 +486,26 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (_) => _CurrencyPickerSheet(
-        currencies: _sampleCurrencies,
-        selected: _selected,
+        currencies: _currencies,
+        selected: selected,
       ),
     );
     if (picked != null) _onCurrencyChanged(picked);
+  }
+
+  // Section label above the amount field. Investment plots use "target" —
+  // the number is what we want to fill *up to*, not a ceiling we're
+  // spending *down*. Bills use "expected payment" (a known due figure);
+  // spending uses "monthly budget" (the soft cap).
+  String _budgetSectionLabel(_PlotKind kind) {
+    switch (kind) {
+      case _PlotKind.fixedObligation:
+        return 'Expected payment';
+      case _PlotKind.investment:
+        return 'Monthly contribution target';
+      case _PlotKind.discretionary:
+        return 'Monthly budget';
+    }
   }
 
   // Form-side label for the inline due-day row. "Pick a day" reads as a
@@ -394,7 +557,10 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (_) => _CropPickerSheet(selected: _selectedCrop),
+      builder: (_) => _CropPickerSheet(
+        options: _cropOptions,
+        selected: _selectedCrop!,
+      ),
     );
     if (picked != null) setState(() => _selectedCrop = picked);
   }
@@ -420,6 +586,14 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_isReady) {
+      return const Scaffold(
+        backgroundColor: CropkeepColors.bgScreen,
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    final selectedCurrency = _selected!;
+    final selectedCrop = _selectedCrop!;
     return Scaffold(
       backgroundColor: CropkeepColors.bgScreen,
       // resizeToAvoidBottomInset stays on so the form shrinks when the
@@ -441,9 +615,11 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
               kind: _kind,
               baseCurrency: _baseCurrency,
               reservoirTotal: widget.reservoirTotal,
-              allocatedSoFar: widget.allocatedSoFar,
+              allocatedSoFar: _effectiveAllocatedSoFar,
               budgetInBase: _budgetInBase,
               isOver: _exceedsReservoir,
+              isEditing: widget.isEditing,
+              editingTitle: widget.existingPlot?.name,
             ),
             Expanded(
               child: SingleChildScrollView(
@@ -455,33 +631,44 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
                     const SizedBox(height: 8),
                     _KindToggle(
                       kind: _kind,
+                      enabled: widget.canEditFinancials,
                       onChanged: (k) => setState(() {
                         _kind = k;
-                        // Discretionary doesn't carry a due_day; clear it
-                        // so toggling back and forth doesn't leave stale
-                        // state behind the toggle.
-                        if (k == _PlotKind.discretionary) _dueDay = null;
+                        // Only fixed_obligation carries a due_day; clear it
+                        // when switching to any other kind so toggling
+                        // doesn't leave stale state behind the picker.
+                        if (k != _PlotKind.fixedObligation) _dueDay = null;
                       }),
                     ),
+                    if (widget.isEditing && !widget.canEditFinancials) ...[
+                      const SizedBox(height: 8),
+                      const _LockedHint(
+                        'Locked — this plot has transactions this cycle.',
+                      ),
+                    ],
                     const SizedBox(height: 24),
                     const _SectionLabel('Name'),
                     const SizedBox(height: 8),
                     _NameField(controller: _nameCtrl, kind: _kind),
                     const SizedBox(height: 24),
-                    _SectionLabel(
-                      _kind == _PlotKind.fixedObligation
-                          ? 'Expected payment'
-                          : 'Monthly budget',
-                    ),
+                    _SectionLabel(_budgetSectionLabel(_kind)),
                     const SizedBox(height: 8),
                     _BudgetField(
                       controller: _amountCtrl,
-                      currency: _selected,
+                      currency: selectedCurrency,
                       isOver: _exceedsReservoir,
+                      enabled: widget.canEditFinancials,
                       onCurrencyTap: _openCurrencyPicker,
                       budgetInBase: _budgetInBase,
                       baseCurrency: _baseCurrency,
                     ),
+                    if (widget.isEditing && !widget.canEditFinancials) ...[
+                      const SizedBox(height: 8),
+                      const _LockedHint(
+                        'Locked — remove this cycle’s transactions or '
+                        'wait for cycle close to change the amount.',
+                      ),
+                    ],
                     if (_kind == _PlotKind.fixedObligation) ...[
                       const SizedBox(height: 24),
                       const _SectionLabel('Due day'),
@@ -499,9 +686,9 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
                     const _SectionLabel('Crop'),
                     const SizedBox(height: 8),
                     _PickerRow(
-                      iconAsset: _selectedCrop.iconAsset,
-                      label: _selectedCrop.name,
-                      sublabel: _cropSublabel(_selectedCrop),
+                      iconAsset: selectedCrop.iconAsset,
+                      label: selectedCrop.name,
+                      sublabel: _cropSublabel(selectedCrop),
                       onTap: _openCropPicker,
                     ),
                     const SizedBox(height: 24),
@@ -517,7 +704,11 @@ class _NewPlotScreenState extends State<NewPlotScreen> {
                 ),
               ),
             ),
-            _StickyCreateBar(enabled: _canCreate, onTap: _onCreate),
+            _StickyCreateBar(
+              enabled: _canCreate,
+              onTap: _onCreate,
+              label: widget.isEditing ? 'Save changes' : 'Create plot',
+            ),
           ],
         ),
       ),
@@ -554,29 +745,6 @@ class _Currency {
   String get flagAsset => spec.flagAsset;
 }
 
-// Sample active currencies. The base sits first so the picker defaults to
-// it; the secondaries demonstrate same-decimals (USD) and different-decimals
-// (JPY, 0 fractional) so the formatter and conversion paths get exercised.
-// Final (not const) because we resolve the spec by lookup against the
-// shared CurrencyCatalog.
-final List<_Currency> _sampleCurrencies = [
-  _Currency(
-    spec: CurrencyCatalog.findByCode('TWD')!,
-    rateToBase: 1.0,
-    isBase: true,
-  ),
-  _Currency(
-    spec: CurrencyCatalog.findByCode('USD')!,
-    rateToBase: 30.0,
-    isBase: false,
-  ),
-  _Currency(
-    spec: CurrencyCatalog.findByCode('JPY')!,
-    rateToBase: 0.21,
-    isBase: false,
-  ),
-];
-
 // ──────────────────────────────────────────────────────────────────────────
 // Header — sand band that mirrors BreakdownEnvelopeHeader's grammar
 // (bgHero, 24px bottom radius, shared shadow tokens, 20px bottom
@@ -600,6 +768,8 @@ class _Header extends StatelessWidget {
     required this.allocatedSoFar,
     required this.budgetInBase,
     required this.isOver,
+    this.isEditing = false,
+    this.editingTitle,
   });
 
   final _PlotKind kind;
@@ -608,13 +778,32 @@ class _Header extends StatelessWidget {
   final int allocatedSoFar;
   final int budgetInBase;
   final bool isOver;
+  // Edit-mode swaps: eyebrow says "EDIT BUDGET" etc and the title is the
+  // plot's actual name instead of the generic "New plot". The reservoir
+  // headline / caption / bar are unchanged — same allocation grammar,
+  // just with the existing plot's own contribution excluded upstream so
+  // the bar reads "other plots + this plot's revised claim".
+  final bool isEditing;
+  final String? editingTitle;
 
   String get _eyebrowText {
+    if (isEditing) {
+      switch (kind) {
+        case _PlotKind.discretionary:
+          return 'EDIT BUDGET ALLOCATION';
+        case _PlotKind.fixedObligation:
+          return 'EDIT BILL';
+        case _PlotKind.investment:
+          return 'EDIT INVESTMENT';
+      }
+    }
     switch (kind) {
       case _PlotKind.discretionary:
         return 'NEW BUDGET ALLOCATION';
       case _PlotKind.fixedObligation:
         return 'NEW BILL';
+      case _PlotKind.investment:
+        return 'NEW INVESTMENT';
     }
   }
 
@@ -663,7 +852,10 @@ class _Header extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _IdentityStrip(eyebrowText: _eyebrowText),
+                      _IdentityStrip(
+                        eyebrowText: _eyebrowText,
+                        title: editingTitle ?? 'New plot',
+                      ),
                       const SizedBox(height: 14),
                       _HeadlineRow(
                         freeBefore: freeBefore,
@@ -709,9 +901,16 @@ class _Header extends StatelessWidget {
 // gesture.
 
 class _IdentityStrip extends StatelessWidget {
-  const _IdentityStrip({required this.eyebrowText});
+  const _IdentityStrip({
+    required this.eyebrowText,
+    this.title = 'New plot',
+  });
 
   final String eyebrowText;
+  // Title shown beneath the eyebrow. Defaults to "New plot" for the
+  // creation flow; edit mode supplies the existing plot's name so the
+  // user can see at a glance which plot they're editing.
+  final String title;
 
   @override
   Widget build(BuildContext context) {
@@ -752,11 +951,11 @@ class _IdentityStrip extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 6),
-              const Text(
-                'New plot',
+              Text(
+                title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: TextStyle(
+                style: const TextStyle(
                   fontFamily: 'Nunito',
                   fontSize: 24,
                   fontWeight: FontWeight.w800,
@@ -976,10 +1175,17 @@ class _AllocationBar extends StatelessWidget {
 // than "an unrelated outlined button".
 
 class _StickyCreateBar extends StatelessWidget {
-  const _StickyCreateBar({required this.enabled, required this.onTap});
+  const _StickyCreateBar({
+    required this.enabled,
+    required this.onTap,
+    this.label = 'Create plot',
+  });
 
   final bool enabled;
   final VoidCallback onTap;
+  // Swapped to "Save changes" by the edit-mode caller. Default keeps the
+  // creation flow's wording so existing call sites need no change.
+  final String label;
 
   @override
   Widget build(BuildContext context) {
@@ -1006,7 +1212,7 @@ class _StickyCreateBar extends StatelessWidget {
           child: Semantics(
             button: true,
             enabled: enabled,
-            label: 'Create plot',
+            label: label,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: enabled ? onTap : null,
@@ -1021,7 +1227,7 @@ class _StickyCreateBar extends StatelessWidget {
                 ),
                 alignment: Alignment.center,
                 child: Text(
-                  'Create plot',
+                  label,
                   style: TextStyle(
                     fontFamily: 'Nunito',
                     fontSize: 16,
@@ -1045,6 +1251,49 @@ class _StickyCreateBar extends StatelessWidget {
 // letter-spacing) so labels feel like content groups in a form rather
 // than the uppercase eyebrows we use on hero surfaces.
 
+// Small caption rendered beneath a locked field in edit mode. Lock icon
+// + secondary copy keeps the affordance unambiguous without needing a
+// disabled tooltip or a separate sheet — the user sees the gate AND the
+// reason in one line at the field's natural read position.
+class _LockedHint extends StatelessWidget {
+  const _LockedHint(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 1),
+            child: Icon(
+              Icons.lock_outline_rounded,
+              size: 13,
+              color: CropkeepColors.textSecondary,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: CropkeepColors.textSecondary,
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _SectionLabel extends StatelessWidget {
   const _SectionLabel(this.text);
 
@@ -1066,137 +1315,193 @@ class _SectionLabel extends StatelessWidget {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Kind toggle — two cards side by side. Bigger than a segmented control
-// because the choice is conceptually load-bearing: discretionary uses
-// rolling pace scoring, fixed obligation uses logged-vs-expected. The
-// explainer line under each title is what makes that choice readable.
+// Kind toggle — single-row segmented control + animated blurb. Compact
+// (~80px total vs ~150px of stacked cards) but still surfaces the kind's
+// accent color (green/gold/blue) and a one-line explainer for the active
+// kind. The blurb fades on change so the user gets feedback on every
+// toggle without a tutorial-block weight running on every plot creation.
+//
+// The choice is conceptually load-bearing: discretionary uses rolling
+// pace scoring, fixed obligation uses logged-vs-expected, investment
+// uses fill-up scoring (overage never penalized). The blurb earns its
+// keep first-time; the accent + label is enough once the user knows.
 
 class _KindToggle extends StatelessWidget {
-  const _KindToggle({required this.kind, required this.onChanged});
+  const _KindToggle({
+    required this.kind,
+    required this.onChanged,
+    this.enabled = true,
+  });
 
   final _PlotKind kind;
   final ValueChanged<_PlotKind> onChanged;
+  // When false, segments still render the current selection (so the user
+  // can SEE what the plot's kind is) but tapping is a no-op. The blurb
+  // beneath stays visible so the user can still read what the active
+  // kind means.
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
-    return IntrinsicHeight(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Expanded(
-            child: _KindCard(
-              title: 'Spending',
-              blurb: 'Money you spend down across the month — food, fun, transport.',
-              selected: kind == _PlotKind.discretionary,
-              accent: CropkeepColors.greenPrimary,
-              onTap: () => onChanged(_PlotKind.discretionary),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _KindSegment(
+                icon: Icons.shopping_basket_outlined,
+                label: 'Spending',
+                accent: CropkeepColors.greenPrimary,
+                selected: kind == _PlotKind.discretionary,
+                enabled: enabled,
+                onTap: () => onChanged(_PlotKind.discretionary),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _KindSegment(
+                icon: Icons.receipt_long_outlined,
+                label: 'Bill',
+                accent: CropkeepColors.goldPrimary,
+                selected: kind == _PlotKind.fixedObligation,
+                enabled: enabled,
+                onTap: () => onChanged(_PlotKind.fixedObligation),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _KindSegment(
+                icon: Icons.trending_up_rounded,
+                label: 'Invest',
+                accent: CropkeepColors.bluePremium,
+                selected: kind == _PlotKind.investment,
+                enabled: enabled,
+                onTap: () => onChanged(_PlotKind.investment),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        // Contextual blurb — only the active kind's description shows.
+        // AnimatedSwitcher fades between blurbs so the user sees a small
+        // confirming motion when toggling. AnimatedSize absorbs the
+        // 1- vs 2-line height delta so siblings beneath don't jump.
+        AnimatedSize(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+          alignment: Alignment.topLeft,
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 180),
+            transitionBuilder: (child, anim) =>
+                FadeTransition(opacity: anim, child: child),
+            child: Padding(
+              key: ValueKey(kind),
+              padding: const EdgeInsets.symmetric(horizontal: 2),
+              child: Text(
+                _blurbFor(kind),
+                style: const TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                  color: CropkeepColors.textSecondary,
+                  height: 1.4,
+                ),
+              ),
             ),
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: _KindCard(
-              title: 'Bill',
-              blurb: 'A known amount paid in one or a few transactions — rent, loans, subscriptions.',
-              selected: kind == _PlotKind.fixedObligation,
-              accent: CropkeepColors.goldPrimary,
-              onTap: () => onChanged(_PlotKind.fixedObligation),
-            ),
-          ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }
 
-class _KindCard extends StatelessWidget {
-  const _KindCard({
-    required this.title,
-    required this.blurb,
-    required this.selected,
+String _blurbFor(_PlotKind kind) {
+  switch (kind) {
+    case _PlotKind.discretionary:
+      return 'Money you spend down across the month — food, fun, transport.';
+    case _PlotKind.fixedObligation:
+      return 'A known amount paid in one or a few transactions — rent, loans, subscriptions.';
+    case _PlotKind.investment:
+      return 'Money you put away toward a target — retirement, brokerage deposits, emergency fund top-ups.';
+  }
+}
+
+// One segment in the kind picker. Visual contract:
+//   • Inactive: white bg, light borderCard, muted secondary text + icon.
+//   • Active:  accent-tinted bg (10% alpha), 1.5px accent border, accent
+//              icon, textPrimary label.
+// The 10% alpha wash lets the segment carry color signal without
+// fighting nearby form chrome; the icon-then-label inline layout keeps
+// the chip short enough that all three fit on a 360px-wide phone.
+class _KindSegment extends StatelessWidget {
+  const _KindSegment({
+    required this.icon,
+    required this.label,
     required this.accent,
+    required this.selected,
     required this.onTap,
+    this.enabled = true,
   });
 
-  final String title;
-  final String blurb;
-  final bool selected;
+  final IconData icon;
+  final String label;
   final Color accent;
+  final bool selected;
   final VoidCallback onTap;
+  // When false, the segment renders normally (still reads as selected /
+  // unselected so the user can see the current kind) but taps are
+  // swallowed. We don't grey the selected segment because the kind is
+  // load-bearing information — even when locked, the user needs to
+  // recognise which kind their plot is.
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: onTap,
+      onTap: enabled ? onTap : null,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 180),
         curve: Curves.easeOut,
-        padding: const EdgeInsets.all(14),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 11),
         decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(14),
+          color: selected ? accent.withValues(alpha: 0.10) : Colors.white,
+          borderRadius: BorderRadius.circular(12),
           border: Border.all(
             color: selected ? accent : CropkeepColors.borderCard,
-            width: selected ? 1.8 : 1,
+            width: selected ? 1.5 : 1,
           ),
-          boxShadow: const [
-            BoxShadow(
-              color: CropkeepColors.shadowCard,
-              blurRadius: 8,
-              offset: Offset(0, 2),
-            ),
-          ],
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    title,
-                    style: const TextStyle(
-                      fontFamily: 'Nunito',
-                      fontSize: 14,
-                      fontWeight: FontWeight.w800,
-                      color: CropkeepColors.textPrimary,
-                      height: 1.2,
-                    ),
-                  ),
-                ),
-                AnimatedScale(
-                  scale: selected ? 1.0 : 0.0,
-                  duration: const Duration(milliseconds: 180),
-                  curve: Curves.easeOut,
-                  child: Container(
-                    width: 18,
-                    height: 18,
-                    decoration: BoxDecoration(
-                      color: accent,
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.check_rounded,
-                      size: 14,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            Text(
-              blurb,
-              style: const TextStyle(
-                fontFamily: 'Nunito',
-                fontSize: 11.5,
-                fontWeight: FontWeight.w500,
-                color: CropkeepColors.textSecondary,
-                height: 1.35,
+        child: Opacity(
+          opacity: enabled || selected ? 1.0 : 0.55,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 16,
+                color: selected ? accent : CropkeepColors.textSecondary,
               ),
-            ),
-          ],
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: 'Nunito',
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                    color: selected
+                        ? CropkeepColors.textPrimary
+                        : CropkeepColors.textSecondary,
+                    height: 1,
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1215,9 +1520,15 @@ class _NameField extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final String hint = kind == _PlotKind.fixedObligation
-        ? 'e.g. Rent, Phone bill, Gym'
-        : 'e.g. Groceries, Transport, Coffee';
+    final String hint;
+    switch (kind) {
+      case _PlotKind.fixedObligation:
+        hint = 'e.g. Rent, Phone bill, Gym';
+      case _PlotKind.investment:
+        hint = 'e.g. Retirement, Brokerage, Emergency fund';
+      case _PlotKind.discretionary:
+        hint = 'e.g. Groceries, Transport, Coffee';
+    }
     return _FieldShell(
       child: TextField(
         controller: controller,
@@ -1266,6 +1577,7 @@ class _BudgetField extends StatelessWidget {
     required this.onCurrencyTap,
     required this.budgetInBase,
     required this.baseCurrency,
+    this.enabled = true,
   });
 
   final TextEditingController controller;
@@ -1276,6 +1588,10 @@ class _BudgetField extends StatelessWidget {
   // in-field conversion echo when the selected currency isn't base.
   final int budgetInBase;
   final _Currency baseCurrency;
+  // Edit-mode lock. When false the amount is read-only and the currency
+  // trigger is non-interactive — the typed value still renders so the
+  // user can see what the existing budget is.
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -1289,7 +1605,9 @@ class _BudgetField extends StatelessWidget {
         : RegExp(r'[0-9.]');
     final Color valueColor = isOver
         ? CropkeepColors.textRedDeep
-        : CropkeepColors.textPrimary;
+        : enabled
+            ? CropkeepColors.textPrimary
+            : CropkeepColors.textSecondary;
     // The conversion echo lives on the SAME ROW as the amount, right of
     // the TextField, and only enters the tree when it's meaningful. No
     // vertical reservation, no dead space — when the field is empty or
@@ -1308,7 +1626,11 @@ class _BudgetField extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          _CurrencyTrigger(currency: currency, onTap: onCurrencyTap),
+          _CurrencyTrigger(
+            currency: currency,
+            onTap: onCurrencyTap,
+            enabled: enabled,
+          ),
           const SizedBox(width: 12),
           Expanded(
             child: TextField(
@@ -1318,6 +1640,7 @@ class _BudgetField extends StatelessWidget {
               // across a TWD → JPY switch.
               key: ValueKey('budget-${currency.code}'),
               controller: controller,
+              enabled: enabled,
               keyboardType: TextInputType.numberWithOptions(
                 decimal: currency.decimals > 0,
               ),
@@ -1371,19 +1694,27 @@ class _BudgetField extends StatelessWidget {
 // touchable object against the white field shell.
 
 class _CurrencyTrigger extends StatelessWidget {
-  const _CurrencyTrigger({required this.currency, required this.onTap});
+  const _CurrencyTrigger({
+    required this.currency,
+    required this.onTap,
+    this.enabled = true,
+  });
 
   final _Currency currency;
   final VoidCallback onTap;
+  // Disabled in edit mode when the plot has live transactions — the user
+  // still sees the locked currency but can't open the picker.
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
     return Semantics(
       button: true,
+      enabled: enabled,
       label: 'Change currency, ${currency.name}',
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: onTap,
+        onTap: enabled ? onTap : null,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(
@@ -1959,8 +2290,9 @@ class _ColorSwatchTile extends StatelessWidget {
 // shape language matches the color picker swatch-for-swatch.
 
 class _CropPickerSheet extends StatefulWidget {
-  const _CropPickerSheet({required this.selected});
+  const _CropPickerSheet({required this.options, required this.selected});
 
+  final List<_CropOption> options;
   final _CropOption selected;
 
   @override
@@ -1983,17 +2315,11 @@ class _CropPickerSheetState extends State<_CropPickerSheet> {
   // explicit in one place.
   void _onTileTap(_CropOption crop) {
     if (!crop.isStarter && (crop.stock ?? 0) == 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            '${crop.name} seeds are out — visit the Market to restock.',
-            style: const TextStyle(
-              fontFamily: 'Nunito',
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          duration: const Duration(seconds: 2),
-        ),
+      CropkeepToast.warning(
+        context,
+        title: 'Out of ${crop.name} seeds',
+        flavor: 'Visit the Market to restock.',
+        duration: const Duration(seconds: 2),
       );
       return;
     }
@@ -2003,9 +2329,9 @@ class _CropPickerSheetState extends State<_CropPickerSheet> {
   @override
   Widget build(BuildContext context) {
     final List<_CropOption> starters =
-        _cropOptions.where((c) => c.isStarter).toList();
+        widget.options.where((c) => c.isStarter).toList();
     final List<_CropOption> seedPacks =
-        _cropOptions.where((c) => !c.isStarter).toList();
+        widget.options.where((c) => !c.isStarter).toList();
 
     return SafeArea(
       top: false,
@@ -2056,24 +2382,31 @@ class _CropPickerSheetState extends State<_CropPickerSheet> {
               const SizedBox(height: 22),
               const _CropSectionEyebrow('SEED PACKS'),
               const SizedBox(height: 10),
-              // Explicit 5 × 3 rows for the same reason the color picker
-              // uses explicit rows: a Wrap would let wider phones fit 6
-              // per row and the deliberate 5×3 shape would be lost.
-              for (int row = 0; row < 3; row++) ...[
+              // Explicit 5-column rows for the same reason the color
+              // picker uses explicit rows: a Wrap would let wider phones
+              // fit 6 per row and the deliberate column rhythm would be
+              // lost. Row count is derived from the actual list length
+              // so a catalog that isn't fully seeded yet (cold-start
+              // race) — or a future catalog with more or fewer paid
+              // crops — won't index past the end and crash the picker.
+              for (int row = 0;
+                  row < (seedPacks.length / 5).ceil();
+                  row++) ...[
                 if (row > 0) const SizedBox(height: 18),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    for (int col = 0; col < 5; col++) ...[
-                      if (col > 0) const SizedBox(width: 8),
-                      _CropTile(
-                        crop: seedPacks[row * 5 + col],
-                        isSelected:
-                            seedPacks[row * 5 + col].id == _picked.id,
-                        onTap: () =>
-                            _onTileTap(seedPacks[row * 5 + col]),
-                      ),
-                    ],
+                    for (int col = 0; col < 5; col++)
+                      if (row * 5 + col < seedPacks.length) ...[
+                        if (col > 0) const SizedBox(width: 8),
+                        _CropTile(
+                          crop: seedPacks[row * 5 + col],
+                          isSelected:
+                              seedPacks[row * 5 + col].id == _picked.id,
+                          onTap: () =>
+                              _onTileTap(seedPacks[row * 5 + col]),
+                        ),
+                      ],
                   ],
                 ),
               ],

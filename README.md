@@ -196,9 +196,9 @@ The biggest reward is reserved for ending the cycle **net positive overall** —
 
 This split is intentional: plots are sized against the **foundation only** (you don't budget around income you can't count on), but the harvest reconciles against **foundation + recorded bonus** (a freelance check that actually arrived is real money that covered your spending). A user can have plots withering and still end the month net positive — and that deserves recognition. The app cares about the holistic outcome, not just per-category discipline.
 
-### Crop set bonuses (at cycle close)
+### Crop set bonuses (paused for v1)
 
-Six themed crop sets (Grain trio, The Orchard, Veggie patch, Berry medley, Nightshade, Tropical trio) award a coin bonus when every crop in the set is assigned to a plot that ended the cycle **harvested** (healthy). A single stressed, withered, or dead plot in the set means no bonus that cycle. Sets vary in difficulty and reward: the easiest set is built entirely from starters plus low-tier consumables; the hardest requires three rare consumables. Sets are the long-term collection goal that keeps the catalog meaningful years in.
+Six themed crop sets (Grain trio, The Orchard, Veggie patch, Berry medley, Nightshade, Tropical trio) were designed to award a coin bonus when every crop in the set ended a cycle **harvested**. The mechanic is paused for v1 while we redesign the in-cycle preview — see [`md/to-do.md`](md/to-do.md) §"Set bonuses paused for v1". The set catalog stays in `MarketCatalog.sets` as the dormant source of truth for when the feature returns.
 
 ### Surplus saved at cycle close
 
@@ -208,7 +208,7 @@ Choosing to Save part of the cycle's surplus (rather than rolling all of it into
 
 Three primary Market categories:
 
-- **Crops** — three starters (wheat, apple, potato) are unlocked at onboarding for free as **permanent** crops, flat yield, no recurring cost. Every other crop is a **consumable seed pack**: buy a pack of N seeds with coins; at the start of each cycle, every plot assigned that crop consumes one seed. Consumable yields are higher than starters but vary by tier — and because the seed costs against the yield, a withered or dead plot loses money on the seed. If a plot's assigned crop runs out of stock, the plot auto-reverts to wheat at cycle start with a notification. Crops also unlock **set bonuses** at cycle close (see below).
+- **Crops** — three starters (wheat, apple, potato) are unlocked at onboarding for free as **permanent** crops, flat yield, no recurring cost. Every other crop is a **consumable seed pack**: buy a pack of N seeds with coins; at the start of each cycle, every plot assigned that crop consumes one seed. Consumable yields are higher than starters but vary by tier — and because the seed costs against the yield, a withered or dead plot loses money on the seed. If a plot's assigned crop runs out of stock, the plot auto-reverts to wheat at cycle start with a notification. (Crop set bonuses are paused for v1 — see below.)
 - **Fertilizers** — consumables. Apply one to a plot any time during a cycle (one per plot per cycle) and it boosts that plot's coin yield at harvest. Stock is tracked in inventory.
 - **Decorations** — one-time purchases. Every owned decoration is always active and contributes a passive farm-wide bonus (no placement step). Effect details and pricing TBD.
 
@@ -286,7 +286,7 @@ A small dot appears on the Farm tab when the bonus pool sits unallocated above a
 
 ### Farmer tab
 
-- Avatar + farmer name + level + title (Sprout / Sapling / Tender / Steward / Elder, optional) + XP progress bar. Tap the avatar to swap between `farmer` and `farmer-fl` (or any unlocked Market avatar).
+- Avatar + farmer name + level + title (Sprout / Sapling / Tender / Steward / Elder, optional) + XP progress bar. Tap the avatar to open the picker — every unlocked Market avatar is equippable; locked ones point to the Market under Skins. The equipped avatar's passive (Beekeeper / Forest Elf / Arcane Wizard) applies at the next harvest.
 - **Savings barn** — cumulative long-term saved value, with a per-cycle contribution breakdown. Its skin can be upgraded with coins.
 - **Harvest History** — a scrollable timeline of past cycles using two layers: outer ring = overall result tier (excellent / solidly positive / barely positive / negative), inner cells = per-plot health summary
 - **Badges** — milestones collected over time
@@ -296,7 +296,7 @@ A small dot appears on the Farm tab when the bonus pool sits unallocated above a
 
 ## Onboarding (one-time, ~5 min)
 
-1. Name your farm — farmer name and avatar. The avatar defaults to the male farmer (`farmer`); female users can switch to `farmer-fl`. Either choice is free; additional avatars unlock later via the Market.
+1. Name your farm — farmer name. The default farmer avatar is free; additional avatars (Pirate, Beekeeper, Forest Elf, Arcane Wizard) unlock later via the Market and equip from the Farmer tab.
 2. Set your base currency
 3. Enable any secondary currencies (skip if not needed)
 4. Add foundation wells (at least one — your reliable income)

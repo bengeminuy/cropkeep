@@ -35,7 +35,7 @@ class PlotCycleResults extends Table {
 
   @override
   List<String> get customConstraints => [
-        "CHECK (kind_snapshot IN ('discretionary', 'fixed_obligation'))",
+        "CHECK (kind_snapshot IN ('discretionary', 'fixed_obligation', 'investment'))",
         "CHECK (final_state IN ('harvested', 'mild_stress', 'withered', 'dead'))",
       ];
 }

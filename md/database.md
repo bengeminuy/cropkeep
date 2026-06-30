@@ -311,8 +311,8 @@ The barn lives on the **Farmer tab** in the UI (not the Farm/Wells subpage) — 
 CREATE TABLE plots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'discretionary' CHECK (kind IN ('discretionary', 'fixed_obligation')),
-    budget_amount INTEGER,          -- in currency_code minor units; NULL only for the Unplanned plot
+    kind TEXT NOT NULL DEFAULT 'discretionary' CHECK (kind IN ('discretionary', 'fixed_obligation', 'investment')),
+    budget_amount INTEGER,          -- in currency_code minor units; NULL only for the Unplanned plot. For investment plots this is the contribution target ("fill up to") rather than a ceiling.
     currency_code TEXT NOT NULL,
     crop_type_id TEXT NOT NULL,
     plot_color_id TEXT,
@@ -324,7 +324,7 @@ CREATE TABLE plots (
     FOREIGN KEY (currency_code) REFERENCES currencies(code),
     FOREIGN KEY (crop_type_id) REFERENCES crops_catalog(crop_id),
     CHECK (is_unplanned = 0 OR kind = 'discretionary'),
-    CHECK (kind = 'discretionary' OR due_day IS NOT NULL)
+    CHECK (kind <> 'fixed_obligation' OR due_day IS NOT NULL)
 );
 
 CREATE INDEX idx_plots_active ON plots(is_active);
@@ -337,7 +337,7 @@ CREATE UNIQUE INDEX idx_plots_unplanned ON plots(is_unplanned) WHERE is_unplanne
 - The Unplanned plot's `budget_amount` is NULL — it has no pre-allocated budget; its in-cycle pressure comes from the free-reservoir calculation, and its harvest-history `final_state` is judged against the user's total income for the cycle (see `plot_cycle_results` below)
 - The Unplanned plot cannot be archived (enforce in application code) and is always `discretionary` kind (CHECK enforced)
 - Regular plots always have `budget_amount` set
-- **Plot kinds:** `discretionary` (default — food, transport, fun money; uses rolling pace) and `fixed_obligation` (rent, loans, subscriptions, fixed bills; pace is irrelevant, scored on logged-vs-expected). Fixed obligation plots require `due_day` (1–31, the expected day of the month payment is due — drives the "Due" indicator on the tile). Discretionary plots may leave `due_day` NULL.
+- **Plot kinds:** `discretionary` (default — food, transport, fun money; uses rolling pace), `fixed_obligation` (rent, loans, subscriptions, fixed bills; pace is irrelevant, scored on logged-vs-expected with asymmetric soft ceiling), and `investment` (retirement contributions, brokerage deposits, emergency-fund top-ups; pace is irrelevant, scored on a **fill-up** rule — meeting or exceeding the target is healthy, underfilling is the only failure mode). Fixed obligation plots require `due_day` (1–31, the expected day of the month payment is due — drives the "Due" indicator on the tile). Discretionary and investment plots may leave `due_day` NULL (investments often auto-deposit on varying days or are flexible by design). Investments share the fixed-obligation reconciliation rule: only what was actually logged counts toward the cycle's `total_spent` — an unfunded contribution didn't move real money.
 
 ### `transactions`
 
@@ -390,7 +390,7 @@ CREATE TABLE plot_cycle_results (
     cycle_id INTEGER NOT NULL,
     plot_id INTEGER NOT NULL,
     plot_name_snapshot TEXT NOT NULL,
-    kind_snapshot TEXT NOT NULL DEFAULT 'discretionary' CHECK (kind_snapshot IN ('discretionary', 'fixed_obligation')),
+    kind_snapshot TEXT NOT NULL DEFAULT 'discretionary' CHECK (kind_snapshot IN ('discretionary', 'fixed_obligation', 'investment')),
     crop_type_id_snapshot TEXT NOT NULL,
     plot_color_id_snapshot TEXT,
     is_unplanned INTEGER NOT NULL DEFAULT 0,
@@ -436,6 +436,17 @@ CREATE INDEX idx_pcr_final_state ON plot_cycle_results(final_state);
 | < 50% or > 150%, or zero logged | `dead` |
 
 The asymmetric soft-ceiling treatment is intentional: small overpayments (bills that wobble) shouldn't punish the user, but underpaying a fixed obligation is a real problem and surfaces sooner than a discretionary overspend.
+
+*Investment plots* — judged on **logged vs. expected** contribution, but with a one-sided **fill-up** rule: meeting or exceeding the target is healthy, and overpayment carries no penalty (Cropkeep treats extra investment as virtuous; any knock-on effect on other plots will surface on those plots' own states and on the cycle surplus). As with fixed obligations, only what was actually logged counts toward the cycle's `total_spent` — an unfunded contribution didn't move real money.
+
+| Logged amount / expected | `final_state` |
+|---|---|
+| ≥ 100% (filled up — target met or exceeded) | `harvested` |
+| 75 – 100% (close, but underfilled) | `mild_stress` |
+| 50 – 75% | `withered` |
+| < 50%, or zero logged | `dead` |
+
+The shape is intentionally generous on the upside: investments are aspirational, so the user should never be punished for going past the target. The cost of overfunding shows up where it matters — surplus, savings barn, or another plot withering — not on the investment plot itself.
 
 *The Unplanned plot* — always `kind = 'discretionary'`, but judged against the user's total income for the cycle (`total_foundation_income + total_bonus_income`) rather than a `budget_amount`. The ratio is recorded in `income_share_at_close`:
 
@@ -489,7 +500,7 @@ CREATE TABLE coin_ledger (
         'unplanned_healthy_share',        -- Unplanned ended cycle below the 'harvested' threshold (< 5% of total income)
         'cycle_overall_positive',         -- the big overall harvest bonus
         'cycle_combo_bonus',
-        'crop_set_bonus',                 -- themed-set bonus when every crop in a set is on a harvested plot
+        'crop_set_bonus',                 -- dormant: set bonuses paused for v1 (see md/to-do.md). Enum + CHECK entry kept because dropping the CHECK string needs a .g.dart regen, blocked by build_runner 2.15.0 / Dart 3.10
         'surplus_saved',                  -- coin reward for the cycle-close Save action
         'badge_unlocked',
         'level_up_bonus',                 -- coin reward when farmer_level increments (level × 25 coins)
@@ -508,7 +519,7 @@ CREATE INDEX idx_coin_occurred ON coin_ledger(occurred_at);
 CREATE INDEX idx_coin_reason ON coin_ledger(reason);
 ```
 
-The `cycle_overall_positive` reason is the big one — issued during cycle close when `cycle_summaries.result_tier` is anything other than `negative`. The `crop_set_bonus` reason is issued once per qualifying set per cycle: for each hardcoded set, if every required crop is assigned to at least one plot with `plot_cycle_results.final_state = 'harvested'`, a row is written with `amount = set.bonus_coins`.
+The `cycle_overall_positive` reason is the big one — issued during cycle close when `cycle_summaries.result_tier` is anything other than `negative`. The `crop_set_bonus` reason is **paused for v1** (no rows are inserted while the feature is on hold — see [`md/to-do.md`](to-do.md) §"Set bonuses paused for v1"). When the feature returns, it will fire once per qualifying set per cycle: for each hardcoded set, if every required crop is assigned to at least one plot with `plot_cycle_results.final_state = 'harvested'`, a row is written with `amount = set.bonus_coins`.
 
 ### `badges_earned`
 
@@ -624,9 +635,16 @@ CREATE INDEX idx_crops_catalog_consumable ON crops_catalog(is_consumable);
 
 Every plot is monthly, so crops don't encode a growth cadence — they differ by visual style, `base_coin_yield`, and whether they're permanent or consumable. Seeded with 3 starter (permanent) crops at onboarding — **wheat, apple, potato** — plus the initial catalog of 15 consumable seed-pack crops. Onboarding also inserts an `owned_items` row for each starter so the user can immediately assign them.
 
-**Permanent vs consumable.** Permanent crops (`is_consumable = 0`) are owned-or-not-owned; `owned_items.quantity` stays at 1. Consumable crops (`is_consumable = 1`) ship in seed packs of `seed_pack_size`; buying a pack increments the matching `owned_items.quantity` by that count. At each cycle start the app iterates every active plot whose assigned crop is consumable and decrements that crop's `owned_items.quantity` by 1. If `quantity` would go below 0, the plot's `crop_type_id` is auto-set to `'wheat'` for the new cycle and the user is notified ("Out of strawberry seeds — planting wheat on Food this cycle"). No silent failure; the user always sees what happened.
+**Permanent vs consumable.** Permanent crops (`is_consumable = 0`) are owned-or-not-owned; `owned_items.quantity` stays at 1. Consumable crops (`is_consumable = 1`) ship in seed packs of `seed_pack_size`; buying a pack increments the matching `owned_items.quantity` by that count.
 
-**Crop sets.** Six themed sets are hardcoded in app code (like badges and farmer titles), not stored as a table — they're a fixed catalog with no user authoring. Each set names a list of required `crop_id`s and a `bonus_coins` amount. Evaluated at cycle close after `plot_cycle_results` are written: for each set, if every required crop is present on at least one plot whose `final_state = 'harvested'` this cycle, insert a `coin_ledger` row with `reason = 'crop_set_bonus'`, `related_type = 'crop_set'`, `related_id` referencing the set's positional index in the hardcoded list (or stored as a `related_set_id` text on a sibling column if added later).
+**Two seed-consumption points.** Consumable seeds are deducted from `owned_items.quantity` at two moments:
+
+1. **Plot creation** — whenever a plot is created or its `crop_type_id` is updated to a different consumable mid-cycle (via `PlotRepository.create` / `update`), the new crop's `owned_items.quantity` is decremented by 1 inside the same transaction. If `quantity < 1` (or no row exists), the write is rejected with `OutOfSeedException` — the picker should gate this case ahead of time, but the repository re-checks defensively so a stale UI snapshot can't authorise a free seed. Switching a plot's crop **does not refund** the old crop's seed; reassignment counts as planting fresh.
+2. **Cycle start** — the app iterates every active plot whose assigned crop is consumable and decrements that crop's `owned_items.quantity` by 1. If `quantity` would go below 0, the plot's `crop_type_id` is auto-set to `'wheat'` for the new cycle and the user is notified ("Out of strawberry seeds — planting wheat on Food this cycle"). No silent failure; the user always sees what happened.
+
+**No refund on archive.** Removing a plot (`PlotRepository.archive`, soft-delete via `is_active = 0`) never refunds a seed. Seeds are consumed at plant time, not reserved — the row deduction is permanent. A plot that survives a cycle boundary therefore costs 2 seeds total (1 at creation, 1 at next cycle start); late-month plots created the day before close pay the same as plots created on day 1.
+
+**Crop sets — paused for v1.** Six themed sets are hardcoded in app code (`MarketCatalog.sets`) like badges and farmer titles, not stored as a table — they're a fixed catalog with no user authoring. Each set names a list of required `crop_id`s and a `bonus_coins` amount. **Paused for v1**: nothing reads the catalog at cycle close today, and no `crop_set_bonus` rows are inserted (see [`md/to-do.md`](to-do.md) §"Set bonuses paused for v1"). When the feature returns, the original rule applies: evaluated at cycle close after `plot_cycle_results` are written: for each set, if every required crop is present on at least one plot whose `final_state = 'harvested'` this cycle, insert a `coin_ledger` row with `reason = 'crop_set_bonus'`, `related_type = 'crop_set'`, `related_id` referencing the set's positional index in the hardcoded list (or stored as a `related_set_id` text on a sibling column if added later).
 
 ### `owned_items`
 
@@ -672,10 +690,11 @@ The `coin_ledger.market_purchase` reason still records every Market spend. For i
 | Plot daily pace (discretionary plots only) | remaining budget ÷ days left in cycle |
 | Plot health state (discretionary) | function of pace ratio (computed each read) |
 | Plot health state (fixed obligation) | function of `SUM(non-deleted transactions this cycle) / budget_amount` plus the `due_day` indicator (Awaiting → Due once `today > due_day` and nothing logged). Pace is NOT used. |
+| Plot health state (investment) | function of `SUM(non-deleted transactions this cycle) / budget_amount` using the fill-up rule: ≥100% harvested, 75–100% mild_stress, 50–75% withered, <50% dead. Pace is NOT used. No upper-bound stress band — overage never lowers the state. |
 | Unplanned share of income | sum of transactions on Unplanned plot in current cycle ÷ projected total income for the cycle (foundation per the rule + logged bonus) |
 | Projected overall result | foundation income for the cycle (per rule above) + logged bonus this cycle − total spent so far (refreshes on every transaction, lets the user see live whether they're tracking positive) |
-| Crop available for assignment | exists in `crops_catalog` AND there is a matching row in `owned_items` (item_type = 'crop', item_id = crop_id). For consumables the `owned_items.quantity` must additionally be ≥ 1 at cycle start (otherwise the plot auto-reverts to wheat). |
-| Crop set bonus eligibility (per set, per cycle) | for each hardcoded set, every required `crop_id` must appear on at least one row in this cycle's `plot_cycle_results` with `final_state = 'harvested'`. If yes, the set's `bonus_coins` is awarded. |
+| Crop available for assignment | exists in `crops_catalog` AND there is a matching row in `owned_items` (item_type = 'crop', item_id = crop_id). For consumables, `owned_items.quantity` must additionally be ≥ 1 at the moment of assignment (`PlotRepository.create` / `update`) — that write decrements stock by 1. At cycle start the same ≥ 1 check is re-applied per active plot; failures auto-revert to wheat. |
+| Crop set bonus eligibility (per set, per cycle) | **paused for v1** — see "Crop sets" above. Original rule (for when it returns): for each hardcoded set, every required `crop_id` must appear on at least one row in this cycle's `plot_cycle_results` with `final_state = 'harvested'`. If yes, the set's `bonus_coins` is awarded. |
 | XP to next level | `100 + (farmer_level × 50) − farmer_xp` |
 | Farmer title | hardcoded mapping from `farmer_level`: 1–4 Sprout, 5–9 Sapling, 10–19 Tender, 20–49 Steward, 50+ Elder |
 
@@ -732,7 +751,7 @@ Additive changes (safe `ALTER TABLE`):
 - New tables: `cycle_summaries`, `savings_barn`
 - New reasons in `coin_ledger` CHECK constraint (requires migration — CHECK constraints can't be altered, need table recreation)
 - New allocation_type in `bonus_allocations` CHECK constraint (same caveat)
-- New CHECK constraints on `plots` (kind enum, due_day range, kind/Unplanned mutual exclusion) and on `plot_cycle_results.kind_snapshot` — both require table recreation under SQLite's rules
+- New CHECK constraints on `plots` (kind enum, due_day range, kind/Unplanned mutual exclusion) and on `plot_cycle_results.kind_snapshot` — both require table recreation under SQLite's rules. Subsequently widening the kind enum to admit `investment` is another CHECK swap — same recreation pattern. The due_day requirement also changes from `kind = 'discretionary' OR due_day IS NOT NULL` to `kind <> 'fixed_obligation' OR due_day IS NOT NULL` so investments can leave it NULL.
 
 For the CHECK constraint changes, drift can handle table recreation as part of its migration system. Manually this is `CREATE TABLE new`, `INSERT SELECT`, `DROP TABLE old`, `RENAME`.
 

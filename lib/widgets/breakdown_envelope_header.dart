@@ -26,9 +26,11 @@ class BreakdownEnvelopeHeader extends StatelessWidget {
     required this.eyebrowText,
     required this.title,
     required this.amountMinor,
+    this.amountDescriptor = 'spent',
     this.overrunMinor = 0,
     required this.captionSpans,
     required this.progressFraction,
+    this.trailing,
   });
 
   // Large left-side identity icon (56px). Plot breakdown supplies the
@@ -44,6 +46,10 @@ class BreakdownEnvelopeHeader extends StatelessWidget {
   // Spent amount in minor units (cents). The header formats it internally
   // so callers don't have to keep a formatter in sync with each other.
   final int amountMinor;
+  // Word that follows the amount ("$X spent" / "$X allocated"). Defaults to
+  // "spent" so callers focused on outflow don't need to think about it; the
+  // cycle ledger swaps in "allocated" when its allocation toggle is active.
+  final String amountDescriptor;
   // Positive when spent exceeds reference (income/budget); 0 otherwise.
   // Surfaced as an inline red chip beside the spent amount.
   final int overrunMinor;
@@ -56,6 +62,10 @@ class BreakdownEnvelopeHeader extends StatelessWidget {
   // share/danger-cap for the wild patch). Clamped to [0, 1] internally;
   // overrun is signaled by the inline chip, the bar itself never goes red.
   final double progressFraction;
+  // Optional widget pinned to the top-right of the header, level with the
+  // back arrow. The plot breakdown uses this slot for its overflow menu
+  // (Remove plot); spending breakdown leaves it null.
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
@@ -91,18 +101,27 @@ class BreakdownEnvelopeHeader extends StatelessWidget {
                 // SVG (built-in circle outline carries the button affordance,
                 // no extra pill chrome needed) tinted to textSecondaryOnHero
                 // so the arrow reads as native to the sand band rather than
-                // a pure-black foreign glyph.
-                IconButton(
-                  icon: SvgPicture.asset(
-                    'assets/icons/back.svg',
-                    width: 28,
-                    height: 28,
-                    colorFilter: const ColorFilter.mode(
-                      CropkeepColors.textSecondaryOnHero,
-                      BlendMode.srcIn,
+                // a pure-black foreign glyph. Trailing slot opposite the
+                // back arrow gives screens an AppBar-like action surface
+                // (e.g. plot breakdown's Remove-plot overflow) without
+                // having to abandon the envelope header for a Material AppBar.
+                Row(
+                  children: [
+                    IconButton(
+                      icon: SvgPicture.asset(
+                        'assets/icons/back.svg',
+                        width: 28,
+                        height: 28,
+                        colorFilter: const ColorFilter.mode(
+                          CropkeepColors.textSecondaryOnHero,
+                          BlendMode.srcIn,
+                        ),
+                      ),
+                      onPressed: () => Navigator.of(context).maybePop(),
                     ),
-                  ),
-                  onPressed: () => Navigator.of(context).maybePop(),
+                    const Spacer(),
+                    ?trailing,
+                  ],
                 ),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(8, 4, 0, 0),
@@ -133,9 +152,9 @@ class BreakdownEnvelopeHeader extends StatelessWidget {
                                   letterSpacing: -0.4,
                                 ),
                               ),
-                              const TextSpan(
-                                text: ' spent',
-                                style: TextStyle(
+                              TextSpan(
+                                text: ' $amountDescriptor',
+                                style: const TextStyle(
                                   fontFamily: 'Nunito',
                                   fontSize: 18,
                                   fontWeight: FontWeight.w600,

@@ -4,7 +4,7 @@ import 'crops_catalog.dart';
 import 'currencies.dart';
 import 'enum_converters.dart';
 
-enum PlotKind { discretionary, fixedObligation }
+enum PlotKind { discretionary, fixedObligation, investment }
 
 @DataClassName('PlotRow')
 class Plots extends Table {
@@ -26,9 +26,9 @@ class Plots extends Table {
 
   @override
   List<String> get customConstraints => [
-        "CHECK (kind IN ('discretionary', 'fixed_obligation'))",
+        "CHECK (kind IN ('discretionary', 'fixed_obligation', 'investment'))",
         'CHECK (due_day IS NULL OR (due_day BETWEEN 1 AND 31))',
         "CHECK (is_unplanned = 0 OR kind = 'discretionary')",
-        "CHECK (kind = 'discretionary' OR due_day IS NOT NULL)",
+        "CHECK (kind <> 'fixed_obligation' OR due_day IS NOT NULL)",
       ];
 }

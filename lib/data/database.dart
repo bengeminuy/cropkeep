@@ -47,7 +47,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTesting(super.executor);
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -71,6 +71,16 @@ class AppDatabase extends _$AppDatabase {
             for (final stmt in _v2NewIndexStatements) {
               await customStatement(stmt);
             }
+          }
+          if (from < 3) {
+            // Widening the plot-kind enum from {discretionary,
+            // fixed_obligation} to also include 'investment'. SQLite can't
+            // ALTER a CHECK constraint in place, so both tables holding the
+            // enum are recreated to pick up the new constraint plus the
+            // loosened due_day requirement (now only fixed_obligation
+            // requires due_day).
+            await m.alterTable(TableMigration(plots));
+            await m.alterTable(TableMigration(plotCycleResults));
           }
         },
       );

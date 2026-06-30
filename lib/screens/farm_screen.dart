@@ -1,14 +1,21 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
 import '../app_scope.dart';
 import '../data/database.dart';
-import '../theme/colors.dart';
+import '../data/repositories/cycle_repository.dart';
+import '../data/tables/plots.dart' show PlotKind;
 import '../data/tables/wells.dart' show WellType;
+import '../theme/colors.dart';
+import '../widgets/cropkeep_toast.dart';
+import 'cycle/cycle_transition_screen.dart';
 import 'farm/general_spending_breakdown_screen.dart';
 import 'farm/new_plot_screen.dart';
 import 'farm/new_well_screen.dart';
 import 'farm/plot_breakdown_screen.dart';
+import 'market/market_catalog.dart';
 
 // ──────────────────────────────────────────────────────────────────────────
 // FarmScreen — first visual pass.
@@ -163,6 +170,510 @@ Stream<CurrencyRow?> _watchBaseCurrency(AppDatabase db, String? code) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Cycle scope — exposes the 1-based cycle day + total cycle length so any
+// descendant that needs them (reservoir bar tick, pace math, breakdown
+// data) can read both from one place instead of plumbing them through five
+// widget constructors. Populated at the top of each subpage from the
+// active cycle row.
+
+class _CycleScope extends InheritedWidget {
+  const _CycleScope({
+    required this.cycleDay,
+    required this.cycleLength,
+    required this.cycleStartWeekday,
+    required this.activeCycleId,
+    required super.child,
+  });
+
+  final int cycleDay;
+  final int cycleLength;
+  final int cycleStartWeekday;
+  final int? activeCycleId;
+
+  // Inclusive of today: the current day is still a day you can spend on, so
+  // pace = remaining ÷ (cycleLength − cycleDay + 1). On day 1 of a 30-day
+  // cycle this is 30, matching the onboarding spec; on the final day it's
+  // 1, so the headline collapses to "spend the rest today."
+  int get daysLeft => (cycleLength - cycleDay + 1).clamp(1, cycleLength);
+
+  static _CycleScope of(BuildContext context) {
+    final scope = context.dependOnInheritedWidgetOfExactType<_CycleScope>();
+    assert(scope != null, '_CycleScope missing — wrap with _CycleProvider.');
+    return scope!;
+  }
+
+  @override
+  bool updateShouldNotify(_CycleScope old) =>
+      cycleDay != old.cycleDay ||
+      cycleLength != old.cycleLength ||
+      cycleStartWeekday != old.cycleStartWeekday ||
+      activeCycleId != old.activeCycleId;
+}
+
+class _CycleProvider extends StatelessWidget {
+  const _CycleProvider({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final scope = AppScope.of(context);
+    return StreamBuilder<CycleRow?>(
+      stream: scope.cycles.watchActiveCycle(),
+      builder: (context, snap) {
+        // A cycle is conceptually a calendar month, so cycleDay /
+        // cycleLength / cycleStartWeekday all derive from `now` and
+        // the month it falls in — regardless of when within the month
+        // the user actually pressed Begin tracking. Pace math gets the
+        // same answer (cycle's end_date is always the last day of the
+        // month), and the breakdown screen's weekday tiles want
+        // calendar weekdays anyway.
+        final cycle = snap.data;
+        final now = DateTime.now();
+        final length = DateTime(now.year, now.month + 1, 0).day;
+        final start = DateTime(now.year, now.month, 1);
+        return _CycleScope(
+          cycleDay: now.day.clamp(1, length),
+          cycleLength: length,
+          cycleStartWeekday: start.weekday,
+          activeCycleId: cycle?.id,
+          child: child,
+        );
+      },
+    );
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// View-model builders — wrap a PlotRow / WellRow with the derived display
+// fields the existing widgets already expect (swatch, status label,
+// visual state, etc.). Keeping the type shape stable means the rendering
+// widgets below don't need to change.
+
+const Map<String, Color> _plotColorTable = {
+  'Tomato': Color(0xFFFFB5B5),
+  'Carrot': Color(0xFFFFCEA8),
+  'Honey': Color(0xFFFFE3A8),
+  'Butter': Color(0xFFFFF5B0),
+  'Lettuce': Color(0xFFD4ECA8),
+  'Mint': Color(0xFFB5E6B8),
+  'Sage': Color(0xFFA8D8C2),
+  'Sky': Color(0xFFB5DCEB),
+  'Cornflower': Color(0xFFB5C5F0),
+  'Lavender': Color(0xFFC9B5F0),
+  'Lilac': Color(0xFFE6B5E6),
+  'Rose': Color(0xFFF5B5D5),
+};
+
+Color _plotSwatchFor(PlotRow row) {
+  if (row.isUnplanned) return const Color(0xFFE6D8BC);
+  final id = row.plotColorId;
+  if (id == null) return CropkeepColors.greenHint;
+  return _plotColorTable[id] ?? CropkeepColors.greenHint;
+}
+
+String _cropIconForCropId(String cropId) {
+  if (cropId == 'unplanned') return 'assets/icons/cornucopia.svg';
+  const starters = {'wheat', 'apple', 'potato'};
+  if (starters.contains(cropId)) return 'assets/icons/crops/$cropId.svg';
+  return 'assets/icons/crops/icons8-${cropId.replaceAll('_', '-')}.svg';
+}
+
+_PlotKind _kindFromRow(PlotKind dbKind) {
+  switch (dbKind) {
+    case PlotKind.discretionary:
+      return _PlotKind.discretionary;
+    case PlotKind.fixedObligation:
+      return _PlotKind.fixedObligation;
+    case PlotKind.investment:
+      return _PlotKind.investment;
+  }
+}
+
+_PlotVisualState _visualStateFor({
+  required int spent,
+  required int? budget,
+  required _PlotKind kind,
+  required bool isUnplanned,
+}) {
+  if (isUnplanned) return _PlotVisualState.growing;
+  if (budget == null || budget <= 0) return _PlotVisualState.growing;
+  final double ratio = spent / budget;
+  switch (kind) {
+    case _PlotKind.fixedObligation:
+      if (spent <= 0) return _PlotVisualState.seedling;
+      if (ratio >= 1.0) return _PlotVisualState.ready;
+      if (ratio >= 0.5) return _PlotVisualState.almostFull;
+      return _PlotVisualState.growing;
+    case _PlotKind.discretionary:
+      if (ratio > 1.0) return _PlotVisualState.withering;
+      if (ratio >= 0.80) return _PlotVisualState.almostFull;
+      return _PlotVisualState.growing;
+    case _PlotKind.investment:
+      if (ratio >= 1.0) return _PlotVisualState.ready;
+      return _PlotVisualState.growing;
+  }
+}
+
+String? _statusLabelFor(_PlotKind kind, _PlotVisualState state, int? dueDay) {
+  if (kind != _PlotKind.fixedObligation) return null;
+  final String dueSuffix = dueDay != null ? ' · Due day $dueDay' : '';
+  switch (state) {
+    case _PlotVisualState.ready:
+      return 'Paid$dueSuffix';
+    case _PlotVisualState.almostFull:
+      return 'Due soon$dueSuffix';
+    case _PlotVisualState.seedling:
+      return 'Awaiting$dueSuffix';
+    case _PlotVisualState.withering:
+      return 'Short$dueSuffix';
+    case _PlotVisualState.growing:
+      return 'Partial$dueSuffix';
+  }
+}
+
+_SamplePlot _plotVmFromRow(
+  PlotRow row, {
+  required int spent,
+  required int totalIncome,
+  required _BaseConverter converter,
+}) {
+  final int? budgetBase = row.budgetAmount == null
+      ? null
+      : converter.toBase(row.budgetAmount!, row.currencyCode);
+  final kind = _kindFromRow(row.kind);
+  final state = _visualStateFor(
+    spent: spent,
+    budget: budgetBase,
+    kind: kind,
+    isUnplanned: row.isUnplanned,
+  );
+  final double? sharePct =
+      row.isUnplanned && totalIncome > 0 ? (spent / totalIncome) * 100 : null;
+  return _SamplePlot(
+    plotId: row.id,
+    name: row.name,
+    iconAsset: _cropIconForCropId(row.cropTypeId),
+    budget: budgetBase,
+    spent: spent,
+    state: state,
+    kind: kind,
+    swatch: _plotSwatchFor(row),
+    statusLabel: _statusLabelFor(kind, state, row.dueDay),
+    dueDay: row.dueDay,
+    isUnplanned: row.isUnplanned,
+    incomeSharePct: sharePct,
+  );
+}
+
+String _formatExpectedSubtitle(
+  WellRow row,
+  CurrencyRow? currency,
+  _BaseConverter converter,
+) {
+  final symbol = currency?.symbol ?? r'$';
+  final decimals = currency?.decimalPlaces ?? 2;
+  if (row.wellType == WellType.foundation && row.expectedAmount != null) {
+    final base = converter.toBase(row.expectedAmount!, row.currencyCode);
+    return 'Expected ${_formatMoney(base, symbol, decimals)} / cycle';
+  }
+  if (row.isCarryover) return 'From last cycle\'s rollover';
+  final hasMin = row.estimateMin != null && row.estimateMin! > 0;
+  final hasMax = row.estimateMax != null && row.estimateMax! > 0;
+  if (hasMin && hasMax) {
+    final minBase = converter.toBase(row.estimateMin!, row.currencyCode);
+    final maxBase = converter.toBase(row.estimateMax!, row.currencyCode);
+    return 'Estimate ${_formatMoney(minBase, symbol, decimals)} – ${_formatMoney(maxBase, symbol, decimals)}';
+  }
+  if (hasMin) {
+    final base = converter.toBase(row.estimateMin!, row.currencyCode);
+    return 'At least ${_formatMoney(base, symbol, decimals)}';
+  }
+  if (hasMax) {
+    final base = converter.toBase(row.estimateMax!, row.currencyCode);
+    return 'Up to ${_formatMoney(base, symbol, decimals)}';
+  }
+  return 'Variable income';
+}
+
+_SampleWell _wellVmFromRow(
+  WellRow row, {
+  required int loggedThisCycle,
+  required CurrencyRow? currency,
+  required _BaseConverter converter,
+}) {
+  final int? expectedInBase =
+      row.wellType == WellType.foundation && row.expectedAmount != null
+          ? converter.toBase(row.expectedAmount!, row.currencyCode)
+          : null;
+  return _SampleWell(
+    id: row.id,
+    name: row.name,
+    iconAsset: row.wellType == WellType.foundation
+        ? 'assets/icons/well.svg'
+        : 'assets/icons/water-bottle.svg',
+    subtitle: _formatExpectedSubtitle(row, currency, converter),
+    loggedThisCycle: loggedThisCycle,
+    isBonus: row.wellType == WellType.bonus,
+    isCarryover: row.isCarryover,
+    expectedInBase: expectedInBase,
+  );
+}
+
+// Converts an amount stored in `sourceCode` minor units to base minor units
+// using the active cycle's rate map. Identity when the source currency is
+// already base. A missing rate defaults to 1.0 — matches new_plot_screen so
+// the reservoir cap and the display agree on the same number. The decimals
+// adjustment handles the (rare) case of a non-base currency whose minor
+// unit differs from base (e.g. JPY with 0 decimals while base is USD).
+class _BaseConverter {
+  const _BaseConverter({
+    required this.baseCode,
+    required this.baseDecimals,
+    required Map<String, CurrencyRow> currencyByCode,
+    required Map<String, double> rateToBase,
+  })  : _currencyByCode = currencyByCode,
+        _rateToBase = rateToBase;
+
+  final String baseCode;
+  final int baseDecimals;
+  final Map<String, CurrencyRow> _currencyByCode;
+  final Map<String, double> _rateToBase;
+
+  int toBase(int sourceMinor, String sourceCode) {
+    if (sourceCode == baseCode) return sourceMinor;
+    final int srcDecimals =
+        _currencyByCode[sourceCode]?.decimalPlaces ?? baseDecimals;
+    final double rate = _rateToBase[sourceCode] ?? 1.0;
+    final num scale = math.pow(10, baseDecimals - srcDecimals);
+    return (sourceMinor * rate * scale).round();
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Single dashboard query — combines plots, foundation/bonus wells, per-cycle
+// spending, and bonus-pool logged so each subpage builds from a coherent
+// snapshot. Without this, individual StreamBuilders could each see slightly
+// different commits and the reservoir / allocated math could disagree
+// across the hero and rows for a frame or two after a write.
+//
+// Currency-aware totals stay simple in Phase 1: amounts already stored in
+// base minor units (transactions.base_amount, income_entries.base_amount)
+// are summed directly. Plot budgets and well expecteds are stored in the
+// row's currency, so they're converted to base via the cycle rate map
+// before they hit the headline. The cycle-transition rate prompt is
+// Phase 2; missing rates default to identity here so the math doesn't
+// silently produce zero.
+
+class _FarmDashboard {
+  const _FarmDashboard({
+    required this.plots,
+    required this.plotSpends,
+    required this.foundationWells,
+    required this.bonusWells,
+    required this.wellLogged,
+    required this.totalSpent,
+    required this.totalBonusLogged,
+    required this.foundationTotal,
+    required this.allocatedSoFar,
+    required this.baseCurrency,
+    required this.converter,
+    required this.fertilizersByPlot,
+  });
+
+  final List<PlotRow> plots;
+  final Map<int, int> plotSpends;
+  final List<WellRow> foundationWells;
+  final List<WellRow> bonusWells;
+  final Map<int, int> wellLogged;
+  final int totalSpent;
+  final int totalBonusLogged;
+  final int foundationTotal;
+  // Sum of every non-Unplanned plot budget, converted to base. Used both
+  // on the reservoir hero and as `allocatedSoFar` when the user opens
+  // the New Plot screen, so passing it down keeps the two consistent.
+  final int allocatedSoFar;
+  final CurrencyRow? baseCurrency;
+  final _BaseConverter converter;
+  // plotId → fertilizer itemId for the active cycle. Drives the small
+  // corner indicator on each Crops row so "which plots are boosted"
+  // is scannable without drilling into the breakdown.
+  final Map<int, String> fertilizersByPlot;
+
+  int get totalIncome => foundationTotal + totalBonusLogged;
+}
+
+class _FarmDataBuilder extends StatelessWidget {
+  const _FarmDataBuilder({required this.builder});
+
+  final Widget Function(BuildContext context, _FarmDashboard data) builder;
+
+  @override
+  Widget build(BuildContext context) {
+    final scope = AppScope.of(context);
+    final cycle = _CycleScope.of(context);
+    final cycleId = cycle.activeCycleId;
+    return StreamBuilder<List<CurrencyRow>>(
+      stream: scope.appSettings.watchCurrencies(),
+      builder: (context, currencySnap) {
+        final currencies = currencySnap.data ?? const <CurrencyRow>[];
+        final base = currencies
+            .where((c) => c.isBase)
+            .cast<CurrencyRow?>()
+            .firstWhere((_) => true, orElse: () => null);
+        final String baseCodeForRates = base?.code ?? 'USD';
+        return StreamBuilder<Map<String, double>>(
+          // Pre-cycle: fall back to the disk-backed pending-rates store
+          // so foundation wells and plot budgets in non-base currencies
+          // convert correctly on the reservoir hero before Begin
+          // tracking. Post-cycle: the cycle-scoped rows take over.
+          stream: cycleId == null
+              ? scope.pendingRates.watch().map(
+                  (m) => {for (final e in m.entries) e.key: e.value.rate})
+              : scope.cycles.watchRatesFor(cycleId).map((rows) => {
+                    for (final r in rows)
+                      if (r.toCurrencyCode == baseCodeForRates)
+                        r.fromCurrencyCode: r.rate,
+                  }),
+          builder: (context, ratesSnap) {
+            final rateToBase = ratesSnap.data ?? const <String, double>{};
+            return StreamBuilder<List<PlotRow>>(
+              stream: scope.plots.watchActivePlots(),
+              builder: (context, plotsSnap) {
+                final plots = plotsSnap.data ?? const <PlotRow>[];
+                return StreamBuilder<List<WellRow>>(
+                  stream: scope.wells.watchActiveWells(),
+                  builder: (context, wellsSnap) {
+                    final wells = wellsSnap.data ?? const <WellRow>[];
+                    return StreamBuilder<Map<int, int>>(
+                      stream: cycleId == null
+                          ? Stream<Map<int, int>>.value(const {})
+                          : scope.transactions.watchPlotSpentByCycle(cycleId),
+                      builder: (context, spendsSnap) {
+                        final plotSpends =
+                            spendsSnap.data ?? const <int, int>{};
+                        return StreamBuilder<Map<int, int>>(
+                          stream: cycleId == null
+                              ? Stream<Map<int, int>>.value(const {})
+                              : scope.incomeEntries
+                                  .watchLoggedByWellAndCycle(cycleId),
+                          builder: (context, loggedSnap) {
+                            final wellLogged =
+                                loggedSnap.data ?? const <int, int>{};
+                            return StreamBuilder<
+                                List<PlotFertilizerApplicationRow>>(
+                              stream: cycleId == null
+                                  ? Stream<List<
+                                          PlotFertilizerApplicationRow>>.value(
+                                      const [])
+                                  : scope.fertilizers.watchByCycle(cycleId),
+                              builder: (context, fertSnap) {
+                                final fertList = fertSnap.data ??
+                                    const <PlotFertilizerApplicationRow>[];
+                                final fertilizersByPlot = <int, String>{
+                                  for (final f in fertList)
+                                    f.plotId: f.fertilizerItemId,
+                                };
+                                return _composeDashboard(
+                                  plots: plots,
+                                  wells: wells,
+                                  plotSpends: plotSpends,
+                                  wellLogged: wellLogged,
+                                  currencies: currencies,
+                                  rateToBase: rateToBase,
+                                  base: base,
+                                  fertilizersByPlot: fertilizersByPlot,
+                                  builder: builder,
+                                  context: context,
+                                );
+                              },
+                            );
+                          },
+                        );
+                      },
+                    );
+                  },
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _composeDashboard({
+    required List<PlotRow> plots,
+    required List<WellRow> wells,
+    required Map<int, int> plotSpends,
+    required Map<int, int> wellLogged,
+    required List<CurrencyRow> currencies,
+    required Map<String, double> rateToBase,
+    required CurrencyRow? base,
+    required Map<int, String> fertilizersByPlot,
+    required BuildContext context,
+    required Widget Function(BuildContext, _FarmDashboard) builder,
+  }) {
+    final String baseCode = base?.code ?? 'USD';
+    final int baseDecimals = base?.decimalPlaces ?? 2;
+    final Map<String, CurrencyRow> currencyByCode = {
+      for (final c in currencies) c.code: c,
+    };
+    final converter = _BaseConverter(
+      baseCode: baseCode,
+      baseDecimals: baseDecimals,
+      currencyByCode: currencyByCode,
+      rateToBase: rateToBase,
+    );
+    final foundation = <WellRow>[];
+    final bonus = <WellRow>[];
+    for (final w in wells) {
+      if (w.wellType == WellType.foundation) {
+        foundation.add(w);
+      } else {
+        bonus.add(w);
+      }
+    }
+    int foundationTotal = 0;
+    for (final w in foundation) {
+      if (w.expectedAmount == null) continue;
+      foundationTotal += converter.toBase(w.expectedAmount!, w.currencyCode);
+    }
+    int allocatedSoFar = 0;
+    for (final p in plots) {
+      if (p.isUnplanned) continue;
+      if (p.budgetAmount == null) continue;
+      allocatedSoFar += converter.toBase(p.budgetAmount!, p.currencyCode);
+    }
+    int totalSpent = 0;
+    for (final v in plotSpends.values) {
+      totalSpent += v;
+    }
+    int totalBonusLogged = 0;
+    for (final w in bonus) {
+      totalBonusLogged += wellLogged[w.id] ?? 0;
+    }
+    return builder(
+      context,
+      _FarmDashboard(
+        plots: plots,
+        plotSpends: plotSpends,
+        foundationWells: foundation,
+        bonusWells: bonus,
+        wellLogged: wellLogged,
+        totalSpent: totalSpent,
+        totalBonusLogged: totalBonusLogged,
+        foundationTotal: foundationTotal,
+        allocatedSoFar: allocatedSoFar,
+        baseCurrency: base,
+        converter: converter,
+        fertilizersByPlot: fertilizersByPlot,
+      ),
+    );
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Segmented control — toggles between Crops and Wells. Pairs with PageView
 // swipe so either gesture advances the other.
 
@@ -294,95 +805,115 @@ class _CropsSubpage extends StatefulWidget {
 class _CropsSubpageState extends State<_CropsSubpage> {
   _PlotFilter _filter = _PlotFilter.all;
 
-  List<_SamplePlot> _filteredPlots() {
+  List<_SamplePlot> _applyFilter(List<_SamplePlot> source) {
     switch (_filter) {
       case _PlotFilter.all:
-        return _samplePlots;
+        return source;
       case _PlotFilter.spending:
-        // "Spending" = discretionary plots, including the Unplanned wild
-        // patch — they're all the buckets the user spends *into*.
-        return _samplePlots
+        return source
             .where((p) => p.kind == _PlotKind.discretionary)
             .toList(growable: false);
       case _PlotFilter.bills:
-        return _samplePlots
+        return source
             .where((p) => p.kind == _PlotKind.fixedObligation)
+            .toList(growable: false);
+      case _PlotFilter.invest:
+        return source
+            .where((p) => p.kind == _PlotKind.investment)
             .toList(growable: false);
     }
   }
 
-  Map<_PlotFilter, int> _counts() {
+  Map<_PlotFilter, int> _counts(List<_SamplePlot> source) {
     int spending = 0;
     int bills = 0;
-    for (final p in _samplePlots) {
-      if (p.kind == _PlotKind.fixedObligation) {
-        bills++;
-      } else {
-        spending++;
+    int invest = 0;
+    for (final p in source) {
+      switch (p.kind) {
+        case _PlotKind.fixedObligation:
+          bills++;
+        case _PlotKind.investment:
+          invest++;
+        case _PlotKind.discretionary:
+          spending++;
       }
     }
     return {
-      _PlotFilter.all: _samplePlots.length,
+      _PlotFilter.all: source.length,
       _PlotFilter.spending: spending,
       _PlotFilter.bills: bills,
+      _PlotFilter.invest: invest,
     };
   }
 
   @override
   Widget build(BuildContext context) {
-    // "Remaining" is the daily glance — actual water still available to
-    // spend. That means foundation income (the reservoir budgeting cap)
-    // PLUS logged bonus income, since logged bonus is real money already
-    // received. Plot creation uses the reservoir cap; this hero uses the
-    // full picture so the user reads what they can actually spend.
-    final int foundationTotal = _sampleFoundationTotal;
-    final int bonusLogged = _sampleBonusWells
-        .fold<int>(0, (sum, w) => sum + w.loggedThisCycle);
-    final int totalIncome = foundationTotal + bonusLogged;
-    final int totalSpent = _samplePlots
-        .fold<int>(0, (sum, p) => sum + p.spent);
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _ReservoirHeroBlock(
-            total: totalIncome,
-            totalSpent: totalSpent,
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => GeneralSpendingBreakdownScreen(
-                  data: GeneralSpendingBreakdownData(
-                    totalIncome: totalIncome,
-                    cycleDay: _cycleDayFake,
-                    cycleLength: _cycleLengthFake,
-                    plots: _samplePlots
-                        .map(_toBreakdownPlot)
-                        .toList(growable: false),
-                  ),
-                ),
+    return _CycleProvider(
+      child: _FarmDataBuilder(
+        builder: (context, data) {
+          final cycle = _CycleScope.of(context);
+          final List<_SamplePlot> plots = [
+            for (final row in data.plots)
+              _plotVmFromRow(
+                row,
+                spent: data.plotSpends[row.id] ?? 0,
+                totalIncome: data.totalIncome,
+                converter: data.converter,
               ),
+          ];
+          final filtered = _applyFilter(plots);
+          return SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const _CycleStatusStrip(),
+                if (cycle.activeCycleId != null) ...[
+                  _ReservoirHeroBlock(
+                    total: data.totalIncome,
+                    totalSpent: data.totalSpent,
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => GeneralSpendingBreakdownScreen(
+                          data: GeneralSpendingBreakdownData(
+                            totalIncome: data.totalIncome,
+                            reservoirTotal: data.foundationTotal,
+                            cycleDay: cycle.cycleDay,
+                            cycleLength: cycle.cycleLength,
+                            plots: plots
+                                .map(_toBreakdownPlot)
+                                .toList(growable: false),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  _PlotFilterChips(
+                    active: _filter,
+                    counts: _counts(plots),
+                    onSelected: (f) => setState(() => _filter = f),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+                _PlotList(
+                  plots: filtered,
+                  totalIncome: data.totalIncome,
+                  reservoirTotal: data.foundationTotal,
+                  allocatedSoFar: data.allocatedSoFar,
+                  activeCycleId: cycle.activeCycleId,
+                  fertilizersByPlot: data.fertilizersByPlot,
+                ),
+              ],
             ),
-          ),
-          const SizedBox(height: 20),
-          _PlotFilterChips(
-            active: _filter,
-            counts: _counts(),
-            onSelected: (f) => setState(() => _filter = f),
-          ),
-          const SizedBox(height: 16),
-          _PlotList(
-            plots: _filteredPlots(),
-            totalIncome: totalIncome,
-          ),
-        ],
+          );
+        },
       ),
     );
   }
 }
 
-enum _PlotFilter { all, spending, bills }
+enum _PlotFilter { all, spending, bills, invest }
 
 // ──────────────────────────────────────────────────────────────────────────
 // Wells subpage — detailed reservoir, bonus pool, foundation + bonus lists.
@@ -392,40 +923,60 @@ class _WellsSubpage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final int foundationTotal = _sampleFoundationTotal;
-    final int bonusLogged = _sampleBonusWells
-        .fold<int>(0, (s, w) => s + w.loggedThisCycle);
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _IncomeSummaryBlock(
-            reservoirTotal: foundationTotal,
-            bonusLogged: bonusLogged,
-          ),
-          const SizedBox(height: 20),
-          _WellsSectionCard(
-            title: 'Foundation wells',
-            wells: _sampleFoundationWells,
-            addLabel: 'Add foundation well',
-            leadingAsset: 'assets/icons/well.svg',
-            addType: WellType.foundation,
-            reservoirTotal: foundationTotal,
-            bonusLogged: bonusLogged,
-          ),
-          const SizedBox(height: 20),
-          _WellsSectionCard(
-            title: 'Bonus wells',
-            wells: _sampleBonusWells,
-            addLabel: 'Add bonus well',
-            leadingAsset: 'assets/icons/water-bottle.svg',
-            addType: WellType.bonus,
-            reservoirTotal: foundationTotal,
-            bonusLogged: bonusLogged,
-          ),
-        ],
+    return _CycleProvider(
+      child: _FarmDataBuilder(
+        builder: (context, data) {
+          final List<_SampleWell> foundationVms = [
+            for (final w in data.foundationWells)
+              _wellVmFromRow(
+                w,
+                loggedThisCycle: data.wellLogged[w.id] ?? 0,
+                currency: data.baseCurrency,
+                converter: data.converter,
+              ),
+          ];
+          final List<_SampleWell> bonusVms = [
+            for (final w in data.bonusWells)
+              _wellVmFromRow(
+                w,
+                loggedThisCycle: data.wellLogged[w.id] ?? 0,
+                currency: data.baseCurrency,
+                converter: data.converter,
+              ),
+          ];
+          return SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _IncomeSummaryBlock(
+                  reservoirTotal: data.foundationTotal,
+                  bonusLogged: data.totalBonusLogged,
+                ),
+                const SizedBox(height: 20),
+                _WellsSectionCard(
+                  title: 'Foundation wells',
+                  wells: foundationVms,
+                  addLabel: 'Add foundation well',
+                  leadingAsset: 'assets/icons/well.svg',
+                  addType: WellType.foundation,
+                  reservoirTotal: data.foundationTotal,
+                  bonusLogged: data.totalBonusLogged,
+                ),
+                const SizedBox(height: 20),
+                _WellsSectionCard(
+                  title: 'Bonus wells',
+                  wells: bonusVms,
+                  addLabel: 'Add bonus well',
+                  leadingAsset: 'assets/icons/water-bottle.svg',
+                  addType: WellType.bonus,
+                  reservoirTotal: data.foundationTotal,
+                  bonusLogged: data.totalBonusLogged,
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -598,13 +1149,16 @@ class _ReservoirHeroBlock extends StatelessWidget {
               overrun: overrun,
             ),
             const SizedBox(height: 14),
-            _ReservoirProgressBar(
-              total: total,
-              spent: totalSpent,
-              isOver: isOver,
-              cycleDay: _cycleDayFake,
-              cycleLength: _cycleLengthFake,
-            ),
+            Builder(builder: (ctx) {
+              final cycle = _CycleScope.of(ctx);
+              return _ReservoirProgressBar(
+                total: total,
+                spent: totalSpent,
+                isOver: isOver,
+                cycleDay: cycle.cycleDay,
+                cycleLength: cycle.cycleLength,
+              );
+            }),
             const SizedBox(height: 12),
             Row(
               crossAxisAlignment: CrossAxisAlignment.center,
@@ -818,29 +1372,44 @@ class _PlotFilterChips extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        _FilterChip(
-          label: 'All',
-          count: counts[_PlotFilter.all] ?? 0,
-          isActive: active == _PlotFilter.all,
-          onTap: () => onSelected(_PlotFilter.all),
-        ),
-        const SizedBox(width: 8),
-        _FilterChip(
-          label: 'Spending',
-          count: counts[_PlotFilter.spending] ?? 0,
-          isActive: active == _PlotFilter.spending,
-          onTap: () => onSelected(_PlotFilter.spending),
-        ),
-        const SizedBox(width: 8),
-        _FilterChip(
-          label: 'Bills',
-          count: counts[_PlotFilter.bills] ?? 0,
-          isActive: active == _PlotFilter.bills,
-          onTap: () => onSelected(_PlotFilter.bills),
-        ),
-      ],
+    // Four chips can exceed the page width on smaller phones once "Invest"
+    // joins All / Spending / Bills, so the row scrolls horizontally and
+    // hides the scrollbar — the count badges already cue the user that
+    // chips exist beyond the active selection if anything overflows.
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      physics: const BouncingScrollPhysics(),
+      child: Row(
+        children: [
+          _FilterChip(
+            label: 'All',
+            count: counts[_PlotFilter.all] ?? 0,
+            isActive: active == _PlotFilter.all,
+            onTap: () => onSelected(_PlotFilter.all),
+          ),
+          const SizedBox(width: 8),
+          _FilterChip(
+            label: 'Spending',
+            count: counts[_PlotFilter.spending] ?? 0,
+            isActive: active == _PlotFilter.spending,
+            onTap: () => onSelected(_PlotFilter.spending),
+          ),
+          const SizedBox(width: 8),
+          _FilterChip(
+            label: 'Bills',
+            count: counts[_PlotFilter.bills] ?? 0,
+            isActive: active == _PlotFilter.bills,
+            onTap: () => onSelected(_PlotFilter.bills),
+          ),
+          const SizedBox(width: 8),
+          _FilterChip(
+            label: 'Invest',
+            count: counts[_PlotFilter.invest] ?? 0,
+            isActive: active == _PlotFilter.invest,
+            onTap: () => onSelected(_PlotFilter.invest),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -923,13 +1492,32 @@ class _FilterChip extends StatelessWidget {
 // row layouts).
 
 class _PlotList extends StatelessWidget {
-  const _PlotList({required this.plots, required this.totalIncome});
+  const _PlotList({
+    required this.plots,
+    required this.totalIncome,
+    required this.reservoirTotal,
+    required this.allocatedSoFar,
+    required this.activeCycleId,
+    required this.fertilizersByPlot,
+  });
 
   final List<_SamplePlot> plots;
   // Cycle's full income (foundation + logged bonus). Plot rows pass it
   // along to PlotBreakdownScreen so the Unplanned drill-down can render
   // "of $X income · X% of income" without re-deriving the figure.
   final int totalIncome;
+  // Reservoir cap = sum of foundation expected. Passed down so the
+  // New Plot screen's allocation bar reads a coherent number.
+  final int reservoirTotal;
+  // Sum of every existing non-Unplanned plot budget. Passed down for
+  // the same reason.
+  final int allocatedSoFar;
+  // Active cycle id — null while the cycle row hasn't loaded yet.
+  // Plot breakdown taps need it to fetch the cycle's transactions.
+  final int? activeCycleId;
+  // plotId → fertilizer itemId for the active cycle. Each row reads
+  // its own entry to decide whether to paint the corner indicator.
+  final Map<int, String> fertilizersByPlot;
 
   @override
   Widget build(BuildContext context) {
@@ -940,7 +1528,8 @@ class _PlotList extends StatelessWidget {
           if (i > 0) const SizedBox(height: 12),
           _PlotRow(
             plot: plots[i],
-            onTap: () => _openPlotBreakdown(context, plots[i]),
+            fertilizerItemId: fertilizersByPlot[plots[i].plotId],
+            onTap: () => _openPlotBreakdown(context, i),
           ),
         ],
         const SizedBox(height: 12),
@@ -952,46 +1541,103 @@ class _PlotList extends StatelessWidget {
   }
 
   // Reservoir cap = foundation only; bonus never counts toward what plots
-  // can be allocated against. Allocation sums every existing non-Unplanned
-  // plot's budget — Unplanned has no pre-allocated budget so it's excluded.
+  // Reservoir cap = foundation only; bonus never counts toward what plots
+  // can be allocated against. The two numbers come from _FarmDataBuilder
+  // upstream so the screen header reads the same values the page does.
   void _openNewPlot(BuildContext context) {
-    final int allocatedSoFar = _samplePlots
-        .where((p) => !p.isUnplanned)
-        .fold<int>(0, (sum, p) => sum + (p.budget ?? 0));
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => NewPlotScreen(
-          reservoirTotal: _sampleFoundationTotal,
+          reservoirTotal: reservoirTotal,
           allocatedSoFar: allocatedSoFar,
         ),
       ),
     );
   }
 
-  void _openPlotBreakdown(BuildContext context, _SamplePlot plot) {
+  Future<void> _openPlotBreakdown(BuildContext context, int index) async {
+    final cycleScope = _CycleScope.of(context);
+    final plot = plots[index];
+    final scope = AppScope.of(context);
+    // Find the matching PlotRow id so we can fetch real transactions.
+    // The plot list is built from PlotRow + spent, so the order matches
+    // _FarmDataBuilder's plots list one-to-one — but we don't have the
+    // id here, so re-fetch by name (Unplanned uniqueness is enforced).
+    // Simpler: pass the id through. For Phase 1, look it up by name.
+    // (Editing the existing _SamplePlot to carry the id is a Phase 2
+    // refactor.) Since the active filter may reorder, we re-resolve by
+    // matching name on the snapshot returned by watchActivePlots.first.
+    final rows = await scope.plots.watchActivePlots().first;
+    final row = rows.firstWhere(
+      (r) => r.name == plot.name && r.isUnplanned == plot.isUnplanned,
+      orElse: () => rows.first,
+    );
+    final cycleId = cycleScope.activeCycleId;
+    final txns = cycleId == null
+        ? const <TransactionRow>[]
+        : await scope.transactions
+            .watchByPlot(plotId: row.id, cycleId: cycleId)
+            .first;
+    if (!context.mounted) return;
+    final start = DateTime.fromMillisecondsSinceEpoch(0);
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => PlotBreakdownScreen(
-          data: _toPlotBreakdownData(plot, totalIncome: totalIncome),
+          data: PlotBreakdownData(
+            plotId: row.id,
+            plotName: plot.name,
+            iconAsset: plot.iconAsset,
+            kind: _toBreakdownKind(plot),
+            budget: plot.budget,
+            cycleDay: cycleScope.cycleDay,
+            cycleLength: cycleScope.cycleLength,
+            cycleStartWeekday: cycleScope.cycleStartWeekday,
+            transactions: txns
+                .map((t) => PlotBreakdownTransaction(
+                      description: t.note ?? 'Logged expense',
+                      amount: t.baseAmount,
+                      cycleDay: _cycleDayOfTxn(t, start, cycleScope),
+                    ))
+                .toList(growable: false),
+            reservoirTotal: reservoirTotal,
+            allocatedSoFar: allocatedSoFar,
+            cycleId: cycleId ?? 0,
+            totalIncome: plot.isUnplanned ? totalIncome : null,
+            incomeSharePct:
+                plot.isUnplanned ? plot.incomeSharePct : null,
+          ),
         ),
       ),
     );
   }
 }
 
-// Static demo values while data wiring is still pending. Pulled to top-level
-// so the reservoir progress bar can sync its time-tick against the same
-// "fake day" the plot rows use for pace math — otherwise the two would
-// drift and reading the screen as a single moment in time would fall apart.
-const int _cycleLengthFake = 30;
-const int _cycleDayFake = _cycleLengthFake - _daysLeftFake;
-const int _daysLeftFake = 14;
+int _cycleDayOfTxn(
+  TransactionRow t,
+  DateTime cycleStart,
+  _CycleScope cycle,
+) {
+  // The 1-based cycle day a transaction was logged on. Falls back to
+  // the current cycle day if the transaction predates the active cycle
+  // (shouldn't happen — log flow stamps cycle_id at write time — but
+  // the guard keeps the picker honest if data ever ages out).
+  final dt = DateTime.fromMillisecondsSinceEpoch(t.spentAt);
+  return dt.day.clamp(1, cycle.cycleLength);
+}
 
 class _PlotRow extends StatelessWidget {
-  const _PlotRow({required this.plot, required this.onTap});
+  const _PlotRow({
+    required this.plot,
+    required this.onTap,
+    this.fertilizerItemId,
+  });
 
   final _SamplePlot plot;
   final VoidCallback onTap;
+  // When non-null, a fertilizer is applied to this plot for the active
+  // cycle and a small icon badge paints over the swatch corner. Lookup
+  // is by id only — name/description aren't needed at this size.
+  final String? fertilizerItemId;
 
   @override
   Widget build(BuildContext context) {
@@ -1024,33 +1670,53 @@ class _PlotRow extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Container(
-              width: 52,
-              height: 52,
-              padding: const EdgeInsets.all(5),
-              decoration: BoxDecoration(
-                // Placeholder until the plot-color picker + Market unlocks
-                // land. Real value will come from plots.plot_color_id (see
-                // database.md). The swatch lives behind the icon, not as
-                // the tile bg, so it doesn't fight the state-driven
-                // background painted by _PlotVisuals.
-                color: plot.swatch,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: SvgPicture.asset(
-                plot.iconAsset,
-                fit: BoxFit.contain,
-              ),
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  width: 52,
+                  height: 52,
+                  padding: const EdgeInsets.all(5),
+                  decoration: BoxDecoration(
+                    // Placeholder until the plot-color picker + Market
+                    // unlocks land. Real value will come from
+                    // plots.plot_color_id (see database.md). The swatch
+                    // lives behind the icon, not as the tile bg, so it
+                    // doesn't fight the state-driven background painted
+                    // by _PlotVisuals.
+                    color: plot.swatch,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: SvgPicture.asset(
+                    plot.iconAsset,
+                    fit: BoxFit.contain,
+                  ),
+                ),
+                // Boost indicator — gold-rimmed badge with the actual
+                // fertilizer icon so the row answers "which fertilizer
+                // is on which plot" without forcing a drill-in. No tap
+                // target: editing lives on the breakdown screen's
+                // fertilizer section, keeping the row's status line
+                // full-width for the actionable daily-pace number.
+                if (!plot.isUnplanned && fertilizerItemId != null)
+                  Positioned(
+                    right: -6,
+                    bottom: -6,
+                    child: _FertilizerBoostBadge(
+                      fertilizerItemId: fertilizerItemId!,
+                    ),
+                  ),
+              ],
             ),
             const SizedBox(width: 14),
-            Expanded(child: _content(visuals, cur)),
+            Expanded(child: _content(context, visuals, cur)),
           ],
         ),
       ),
     );
   }
 
-  Widget _content(_PlotVisuals visuals, _BaseCurrencyScope cur) {
+  Widget _content(BuildContext context, _PlotVisuals visuals, _BaseCurrencyScope cur) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -1083,7 +1749,7 @@ class _PlotRow extends StatelessWidget {
         Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Expanded(child: _statusLine(visuals.statusColor, cur)),
+            Expanded(child: _statusLine(context, visuals.statusColor, cur)),
             const SizedBox(width: 8),
             const _ForwardChevron(onHero: false),
           ],
@@ -1106,6 +1772,27 @@ class _PlotRow extends StatelessWidget {
         cur: cur,
         amount: plot.budget ?? 0,
         descriptor: _fixedObligationDescriptor(),
+        amountColor: CropkeepColors.textPrimary,
+      );
+    }
+    if (plot.kind == _PlotKind.investment) {
+      // Fill-up framing: the headline reads as how much there is left to
+      // contribute, never as "spent". Once the target is met or exceeded
+      // we flip to "filled" — going over is fine, so no red.
+      final int target = plot.budget ?? 0;
+      final int remaining = target - plot.spent;
+      if (remaining <= 0) {
+        return _amount(
+          cur: cur,
+          amount: plot.spent,
+          descriptor: 'filled',
+          amountColor: CropkeepColors.textGreenDeep,
+        );
+      }
+      return _amount(
+        cur: cur,
+        amount: remaining,
+        descriptor: 'to go',
         amountColor: CropkeepColors.textPrimary,
       );
     }
@@ -1165,13 +1852,30 @@ class _PlotRow extends StatelessWidget {
     }
   }
 
-  Widget _statusLine(Color statusColor, _BaseCurrencyScope cur) {
+  Widget _statusLine(BuildContext context, Color statusColor, _BaseCurrencyScope cur) {
     final String text;
     if (plot.isUnplanned) {
-      text =
-          '${plot.incomeSharePct!.toStringAsFixed(1)}% of income · wild patch';
+      final share = plot.incomeSharePct;
+      text = share == null
+          ? 'Wild patch · awaiting income'
+          : '${share.toStringAsFixed(1)}% of income · wild patch';
     } else if (plot.kind == _PlotKind.fixedObligation) {
       text = plot.statusLabel ?? 'Awaiting';
+    } else if (plot.kind == _PlotKind.investment) {
+      // Investments read as "fill toward a target", not "spend toward a
+      // ceiling." Surface progress as a percentage of target so a half-
+      // full bar lines up with "50% of target" rather than "50% of cap."
+      // Once at or past target, copy switches to a steady "On target".
+      final int target = plot.budget ?? 0;
+      if (target <= 0) {
+        text = 'Set a target';
+      } else if (plot.spent >= target) {
+        text = 'On target';
+      } else {
+        final int pct = ((plot.spent / target) * 100).round();
+        text =
+            '$pct% of ${_formatMoney(target, cur.symbol, cur.decimals)} target';
+      }
     } else {
       // Discretionary plots show pace as long as there's budget left to
       // spend — it's the actionable daily target. Once spent ≥ budget the
@@ -1180,7 +1884,8 @@ class _PlotRow extends StatelessWidget {
       final int budget = plot.budget ?? 0;
       final int remaining = budget - plot.spent;
       if (remaining > 0) {
-        final pace = remaining ~/ _daysLeftFake;
+        final daysLeft = _CycleScope.of(context).daysLeft;
+        final pace = remaining ~/ daysLeft;
         text = '≈${_formatMoney(pace, cur.symbol, cur.decimals)}/day to stay on track';
       } else {
         text = 'Withering';
@@ -1199,6 +1904,66 @@ class _PlotRow extends StatelessWidget {
       ),
     );
   }
+}
+
+// Visual-only "this plot is boosted by X" indicator floating off the
+// swatch's bottom-right corner. Naked SVG (no plate, no ring) so it
+// reads as a magical effect on the crop rather than a UI notification
+// badge. A silhouette shadow — same artwork, dark tint, 1px down —
+// gives separation against light swatch colors without adding chrome.
+//
+// Deliberately not tappable: the status line below carries the
+// actionable daily-pace number, and editing fertilizer lives on the
+// breakdown screen's dedicated section.
+class _FertilizerBoostBadge extends StatelessWidget {
+  const _FertilizerBoostBadge({required this.fertilizerItemId});
+
+  final String fertilizerItemId;
+
+  static const double _size = 24;
+
+  @override
+  Widget build(BuildContext context) {
+    final iconAsset = _fertilizerIconForId(fertilizerItemId);
+    return SizedBox(
+      width: _size,
+      height: _size,
+      child: Stack(
+        children: [
+          // Shadow layer — same artwork tinted via srcIn so the SVG's
+          // own colors are replaced by a single dark tone, then offset
+          // 1px down. Mirrors the silhouette rather than painting a
+          // rectangular box shadow, which is what makes a non-
+          // rectangular icon read as lifted off the page.
+          Transform.translate(
+            offset: const Offset(0, 1),
+            child: SvgPicture.asset(
+              iconAsset,
+              width: _size,
+              height: _size,
+              colorFilter: ColorFilter.mode(
+                Colors.black.withValues(alpha: 0.22),
+                BlendMode.srcIn,
+              ),
+            ),
+          ),
+          SvgPicture.asset(iconAsset, width: _size, height: _size),
+        ],
+      ),
+    );
+  }
+}
+
+// Catalog lookup for the boost badge's icon. Plot rows render many at
+// once so the lookup needs to be cheap — a linear scan over the
+// 8-item static fertilizer list avoids allocating a map on every
+// render. Falls back to the generic fertilizer.svg for an id that's
+// missing from the catalog (e.g. mid-migration).
+String _fertilizerIconForId(String itemId) {
+  for (final spec in MarketCatalog.fertilizers) {
+    if (spec.itemId == itemId) return spec.iconAsset;
+  }
+  return 'assets/icons/fertilizers/fertilizer.svg';
 }
 
 class _PlotProgressBar extends StatelessWidget {
@@ -1265,7 +2030,7 @@ class _PlotProgressBar extends StatelessWidget {
 
 enum _PlotVisualState { seedling, growing, almostFull, ready, withering }
 
-enum _PlotKind { discretionary, fixedObligation }
+enum _PlotKind { discretionary, fixedObligation, investment }
 
 class _PlotVisuals {
   const _PlotVisuals({
@@ -1678,10 +2443,265 @@ class _WellRow extends StatelessWidget {
                 ),
               ],
             ),
+            // Carryover wells are system-managed (created during cycle
+            // transitions), so the overflow affordance is suppressed —
+            // there is nothing the user can do to them. For every other
+            // well, the trailing ⋮ opens the remove flow. Visual weight
+            // is kept light (20px glyph, ~36px hit box, secondary color)
+            // so it reads as a quiet secondary action against the
+            // amount, not as a peer to the row's primary tap.
+            if (!well.isCarryover) ...[
+              const SizedBox(width: 4),
+              _WellRowOverflowButton(well: well),
+            ],
           ],
         ),
       ),
     );
+  }
+}
+
+// Trailing overflow button on a well row. Lives outside the row's main
+// InkWell only by tap dispatch — the IconButton has its own Material ink
+// so taps on the glyph open the remove flow instead of the row's primary
+// "log income — coming soon" placeholder. Compact (36×36 hit box) so the
+// row height stays the same as before the affordance was added.
+class _WellRowOverflowButton extends StatelessWidget {
+  const _WellRowOverflowButton({required this.well});
+
+  final _SampleWell well;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 36,
+      height: 36,
+      child: IconButton(
+        tooltip: 'More',
+        padding: EdgeInsets.zero,
+        iconSize: 20,
+        splashRadius: 18,
+        constraints: const BoxConstraints(),
+        onPressed: () => _showRemoveWellConfirmSheet(context, well),
+        icon: const Icon(
+          Icons.more_vert_rounded,
+          color: CropkeepColors.textSecondary,
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> _showRemoveWellConfirmSheet(
+  BuildContext context,
+  _SampleWell well,
+) async {
+  // Resolve the currency-formatted shrink string HERE — at the call
+  // site, where _BaseCurrencyProvider is still visible. The modal route
+  // is pushed onto the Navigator above the Scaffold body, so the sheet's
+  // own build context can't reach our InheritedWidget. Doing the format
+  // up-front means the sheet stays pure (no scope dependency) and a
+  // missing provider can't black-hole the sheet contents.
+  String? shrinkText;
+  if (!well.isBonus && well.expectedInBase != null) {
+    final cur = _BaseCurrencyScope.of(context);
+    shrinkText = _formatMoney(well.expectedInBase!, cur.symbol, cur.decimals);
+  }
+  final bool? confirmed = await showModalBottomSheet<bool>(
+    context: context,
+    backgroundColor: Colors.transparent,
+    isScrollControlled: true,
+    builder: (_) => _RemoveWellConfirmSheet(
+      well: well,
+      shrinkText: shrinkText,
+    ),
+  );
+  if (confirmed != true) return;
+  if (!context.mounted) return;
+  await AppScope.of(context).wells.archive(well.id);
+}
+
+// Direct-confirm sheet (no intermediate action sheet) — wells currently
+// expose a single management action, so an action sheet just to relay
+// one row through would be extra ceremony. When an Edit-well screen
+// ships, promote this to the plot's two-step pattern.
+//
+// Three rendering modes from one widget so all the "what happens when I
+// remove this well" copy lives in one place:
+//   • blocked — has income logged this cycle. Removal is gated until the
+//     entries are removed or the cycle closes (mirrors the plot
+//     "transactions this cycle" gate). Single Close button so the user
+//     can't accidentally confirm a no-op.
+//   • foundation — emphasizes the reservoir-shrink consequence with the
+//     exact base-currency amount, since the expected_amount is what plot
+//     budgets are allocated against.
+//   • bonus — simple "history stays intact" reassurance; bonus wells
+//     just categorize logged income, they don't carry allocation load.
+class _RemoveWellConfirmSheet extends StatelessWidget {
+  const _RemoveWellConfirmSheet({
+    required this.well,
+    required this.shrinkText,
+  });
+
+  final _SampleWell well;
+  // Pre-formatted reservoir-shrink amount, resolved at the call site so
+  // the sheet does not need to touch _BaseCurrencyScope (which lives
+  // below the Navigator and isn't visible from a modal route). Null for
+  // bonus wells or for the blocked variant.
+  final String? shrinkText;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool blocked = well.loggedThisCycle > 0;
+
+    return Container(
+      decoration: const BoxDecoration(
+        color: CropkeepColors.bgScreen,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: CropkeepColors.borderDivider,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Text.rich(
+              TextSpan(
+                style: const TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  color: CropkeepColors.textPrimary,
+                ),
+                children: [
+                  TextSpan(text: blocked ? "Can't remove " : 'Remove '),
+                  TextSpan(
+                    text: well.name,
+                    style: const TextStyle(
+                      color: CropkeepColors.textRedDeep,
+                    ),
+                  ),
+                  TextSpan(text: blocked ? '' : '?'),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _bodyCopy(),
+              style: const TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: CropkeepColors.textSecondary,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 18),
+            if (blocked)
+              SizedBox(
+                height: 48,
+                child: TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  style: TextButton.styleFrom(
+                    foregroundColor: CropkeepColors.textPrimary,
+                    textStyle: const TextStyle(
+                      fontFamily: 'Nunito',
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    side: const BorderSide(
+                      color: CropkeepColors.borderCard,
+                      width: 1.5,
+                    ),
+                  ),
+                  child: const Text('Close'),
+                ),
+              )
+            else
+              Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 48,
+                      child: TextButton(
+                        onPressed: () => Navigator.of(context).pop(false),
+                        style: TextButton.styleFrom(
+                          foregroundColor: CropkeepColors.textPrimary,
+                          textStyle: const TextStyle(
+                            fontFamily: 'Nunito',
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          side: const BorderSide(
+                            color: CropkeepColors.borderCard,
+                            width: 1.5,
+                          ),
+                        ),
+                        child: const Text('Cancel'),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: SizedBox(
+                      height: 48,
+                      child: FilledButton(
+                        onPressed: () => Navigator.of(context).pop(true),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: CropkeepColors.redAlert,
+                          foregroundColor: Colors.white,
+                          textStyle: const TextStyle(
+                            fontFamily: 'Nunito',
+                            fontSize: 15,
+                            fontWeight: FontWeight.w800,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                        child: const Text('Remove'),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _bodyCopy() {
+    if (well.loggedThisCycle > 0) {
+      return 'It has income logged this cycle. Remove those entries '
+          'first, or wait until the cycle closes — past income stays '
+          'tied to the well that recorded it.';
+    }
+    if (shrinkText != null) {
+      return 'Your reservoir will shrink by $shrinkText. Plot budgets '
+          'you already allocated against the larger reservoir will read '
+          'as over-allocated until you rebalance.';
+    }
+    return 'It will disappear from your Wells list right away. Past '
+        'cycles will still reference it in their history.';
   }
 }
 
@@ -1761,11 +2781,13 @@ class _AddWellRow extends StatelessWidget {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Sample data — hardcoded so the screen is visually populated while the data
-// layer catches up. All amounts are in base-currency minor units (cents).
+// View-model types — populated from PlotRow / WellRow via the factories
+// above. The shape is stable so the rendering widgets below don't need
+// to know the data layer changed.
 
 class _SamplePlot {
   const _SamplePlot({
+    required this.plotId,
     required this.name,
     required this.iconAsset,
     required this.budget,
@@ -1777,58 +2799,51 @@ class _SamplePlot {
     this.dueDay,
     this.isUnplanned = false,
     this.incomeSharePct,
-    this.transactions = const [],
   });
 
+  // Source plot row id. Plumbed through so the row can paint
+  // per-plot affordances (fertilizer corner indicator) and the
+  // breakdown handoff doesn't need to re-resolve by name.
+  final int plotId;
   final String name;
   final String iconAsset;
   final int? budget;
   final int spent;
   final _PlotVisualState state;
   final _PlotKind kind;
-  // Cosmetic backdrop painted behind the plot's crop icon on the Crops
-  // row. Default is the same wash the new-plot form previews ("Default
-  // green"). Once the picker + Market unlocks land, this maps from
-  // plots.plot_color_id.
   final Color swatch;
   final String? statusLabel;
   final int? dueDay;
   final bool isUnplanned;
   final double? incomeSharePct;
-  // Hardcoded transactions for the plot-breakdown drill-down. Amounts must
-  // sum to `spent` so the breakdown's "of $X spent" totals reconcile with
-  // the Crops row. Replaced by repository data once wiring lands.
-  final List<_SampleTransaction> transactions;
-}
-
-class _SampleTransaction {
-  const _SampleTransaction({
-    required this.description,
-    required this.amount,
-    required this.cycleDay,
-  });
-
-  final String description;
-  final int amount;
-  final int cycleDay;
 }
 
 class _SampleWell {
   const _SampleWell({
+    required this.id,
     required this.name,
     required this.iconAsset,
     required this.subtitle,
     required this.loggedThisCycle,
     required this.isBonus,
     this.isCarryover = false,
+    this.expectedInBase,
   });
 
+  // Source well row id — plumbed so the row's overflow menu can call
+  // wells.archive(id) without re-resolving by name.
+  final int id;
   final String name;
   final String iconAsset;
   final String? subtitle;
   final int loggedThisCycle;
   final bool isBonus;
   final bool isCarryover;
+  // Foundation only: expected_amount converted to base minor so the
+  // remove sheet can say "your reservoir shrinks by $X" without redoing
+  // the currency math at the leaf. Null for bonus wells (their estimates
+  // are advisory, not reservoir-load-bearing).
+  final int? expectedInBase;
 }
 
 // Maps the local sample types to the breakdown screen's public model. Lives
@@ -1838,6 +2853,7 @@ BreakdownPlot _toBreakdownPlot(_SamplePlot p) => BreakdownPlot(
       name: p.name,
       iconAsset: p.iconAsset,
       spent: p.spent,
+      budget: p.budget,
       kind: _toBreakdownKind(p),
     );
 
@@ -1848,230 +2864,12 @@ BreakdownPlotKind _toBreakdownKind(_SamplePlot p) {
       return BreakdownPlotKind.discretionary;
     case _PlotKind.fixedObligation:
       return BreakdownPlotKind.fixedObligation;
+    case _PlotKind.investment:
+      return BreakdownPlotKind.investment;
   }
 }
 
-// Maps the local sample plot to the per-plot breakdown screen's public
-// model. Mirrors _toBreakdownPlot — keeps the drill-down screen decoupled
-// from farm_screen's private types.
-PlotBreakdownData _toPlotBreakdownData(
-  _SamplePlot p, {
-  required int totalIncome,
-}) {
-  return PlotBreakdownData(
-    plotName: p.name,
-    iconAsset: p.iconAsset,
-    kind: _toBreakdownKind(p),
-    budget: p.budget,
-    cycleDay: _cycleDayFake,
-    cycleLength: _cycleLengthFake,
-    // Demo cycle starts on a Monday (DateTime.monday == 1). Replaced by
-    // the active cycle's real start weekday once data wiring lands.
-    cycleStartWeekday: DateTime.monday,
-    transactions: p.transactions
-        .map((t) => PlotBreakdownTransaction(
-              description: t.description,
-              amount: t.amount,
-              cycleDay: t.cycleDay,
-            ))
-        .toList(growable: false),
-    totalIncome: p.isUnplanned ? totalIncome : null,
-    incomeSharePct: p.isUnplanned ? p.incomeSharePct : null,
-  );
-}
 
-// Foundation total: Salary 4,000.00 + Rental 800.00 = 4,800.00.
-const int _sampleFoundationTotal = 480000;
-
-// Display order on the Crops grid: Unplanned first, then state-sorted
-// discretionary (withering → almost-full → growing), then fixed-obligation.
-// This makes the most-concerning plots surface near the top.
-const List<_SamplePlot> _samplePlots = [
-  _SamplePlot(
-    name: 'Unplanned',
-    // TODO: swap to a dedicated wildflower sticker once that asset lands —
-    // see md/graphics.md. Cornucopia stands in as a warm, neutral placeholder.
-    iconAsset: 'assets/icons/cornucopia.svg',
-    budget: null,
-    spent: 4500,
-    state: _PlotVisualState.growing,
-    kind: _PlotKind.discretionary,
-    // Sand-tone swatch — the wild patch doesn't belong to a category, so
-    // it reads as neutral ground rather than a chosen color.
-    swatch: Color(0xFFE6D8BC),
-    isUnplanned: true,
-    incomeSharePct: 3.2,
-    transactions: [
-      _SampleTransaction(
-        description: 'Phone charger replacement',
-        amount: 2500,
-        cycleDay: 4,
-      ),
-      _SampleTransaction(
-        description: 'Late-night taxi',
-        amount: 2000,
-        cycleDay: 12,
-      ),
-    ],
-  ),
-  _SamplePlot(
-    name: 'Fun money',
-    iconAsset: 'assets/icons/crops/icons8-blueberry.svg',
-    budget: 15000,
-    spent: 15800,
-    state: _PlotVisualState.withering,
-    kind: _PlotKind.discretionary,
-    swatch: Color(0xFFE1D4F0),
-    transactions: [
-      _SampleTransaction(
-        description: 'Concert tickets',
-        amount: 8000,
-        cycleDay: 9,
-      ),
-      _SampleTransaction(
-        description: 'Vinyl record',
-        amount: 3500,
-        cycleDay: 14,
-      ),
-      _SampleTransaction(
-        description: 'Bar tab',
-        amount: 2800,
-        cycleDay: 6,
-      ),
-      _SampleTransaction(
-        description: 'Magazine',
-        amount: 1500,
-        cycleDay: 2,
-      ),
-    ],
-  ),
-  _SamplePlot(
-    name: 'Transport',
-    iconAsset: 'assets/icons/crops/icons8-corn.svg',
-    budget: 30000,
-    spent: 26000,
-    state: _PlotVisualState.almostFull,
-    kind: _PlotKind.discretionary,
-    swatch: Color(0xFFCFE3F2),
-    transactions: [
-      _SampleTransaction(
-        description: 'Monthly transit pass',
-        amount: 12000,
-        cycleDay: 1,
-      ),
-      _SampleTransaction(
-        description: 'Gas refill',
-        amount: 8500,
-        cycleDay: 11,
-      ),
-      _SampleTransaction(
-        description: 'Uber rides',
-        amount: 5500,
-        cycleDay: 13,
-      ),
-    ],
-  ),
-  _SamplePlot(
-    name: 'Food',
-    iconAsset: 'assets/icons/crops/icons8-strawberry.svg',
-    budget: 60000,
-    spent: 32000,
-    state: _PlotVisualState.growing,
-    kind: _PlotKind.discretionary,
-    swatch: Color(0xFFFFD9B8),
-    transactions: [
-      _SampleTransaction(
-        description: 'Weekly groceries',
-        amount: 14000,
-        cycleDay: 7,
-      ),
-      _SampleTransaction(
-        description: 'Lunch out',
-        amount: 6500,
-        cycleDay: 10,
-      ),
-      _SampleTransaction(
-        description: 'Coffee runs',
-        amount: 4500,
-        cycleDay: 15,
-      ),
-      _SampleTransaction(
-        description: 'Takeout dinner',
-        amount: 4000,
-        cycleDay: 5,
-      ),
-      _SampleTransaction(
-        description: 'Snacks',
-        amount: 3000,
-        cycleDay: 3,
-      ),
-    ],
-  ),
-  _SamplePlot(
-    name: 'Rent',
-    iconAsset: 'assets/icons/crops/apple.svg',
-    budget: 150000,
-    spent: 150000,
-    state: _PlotVisualState.ready,
-    kind: _PlotKind.fixedObligation,
-    swatch: Color(0xFFFFCFD0),
-    statusLabel: 'Paid · day 5',
-    dueDay: 5,
-    transactions: [
-      _SampleTransaction(
-        description: 'Monthly rent',
-        amount: 150000,
-        cycleDay: 5,
-      ),
-    ],
-  ),
-  _SamplePlot(
-    name: 'Subscriptions',
-    iconAsset: 'assets/icons/crops/wheat.svg',
-    budget: 8000,
-    spent: 0,
-    state: _PlotVisualState.seedling,
-    kind: _PlotKind.fixedObligation,
-    swatch: Color(0xFFFFE9A8),
-    statusLabel: 'Awaiting · day 15',
-    dueDay: 15,
-  ),
-];
-
-const List<_SampleWell> _sampleFoundationWells = [
-  _SampleWell(
-    name: 'Salary',
-    iconAsset: 'assets/icons/well.svg',
-    subtitle: 'Expected \$4,000.00 / cycle',
-    loggedThisCycle: 360000,
-    isBonus: false,
-  ),
-  _SampleWell(
-    name: 'Rental',
-    iconAsset: 'assets/icons/well.svg',
-    subtitle: 'Expected \$800.00 / cycle',
-    loggedThisCycle: 0,
-    isBonus: false,
-  ),
-];
-
-const List<_SampleWell> _sampleBonusWells = [
-  _SampleWell(
-    name: 'Carryover',
-    iconAsset: 'assets/icons/water-bottle.svg',
-    subtitle: 'From last cycle\'s rollover',
-    loggedThisCycle: 12000,
-    isBonus: true,
-    isCarryover: true,
-  ),
-  _SampleWell(
-    name: 'Freelance',
-    iconAsset: 'assets/icons/water-bottle.svg',
-    subtitle: 'Estimate ~\$500 – \$1,500',
-    loggedThisCycle: 70000,
-    isBonus: true,
-  ),
-];
 
 // ──────────────────────────────────────────────────────────────────────────
 // Shared primitives — mirror of farmer_screen.dart conventions. Once both
@@ -2232,17 +3030,11 @@ class _SectionHeader extends StatelessWidget {
 }
 
 void _comingSoon(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(
-      content: Text(
-        message,
-        style: const TextStyle(
-          fontFamily: 'Nunito',
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      duration: const Duration(seconds: 2),
-    ),
+  CropkeepToast.info(
+    context,
+    title: message,
+    icon: Icons.hourglass_empty_rounded,
+    duration: const Duration(seconds: 2),
   );
 }
 
@@ -2269,4 +3061,271 @@ String _withThousandsSeparator(int value) {
     out.write(s[i]);
   }
   return out.toString();
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Cycle status strip
+//
+// Only renders at cycle boundaries — during an active, in-period cycle
+// it returns SizedBox.shrink(). The header's day-X/Y pill carries the
+// progress signal while the cycle is running, so showing the strip
+// there too would be noise. Three states still surface a CTA:
+//
+// • No active cycle, no prior cycle → first-time hero ("Begin tracking
+//   your first cycle").
+// • No active cycle, prior cycle exists → between-cycles hero ("Begin
+//   tracking [month]").
+// • Active cycle past end_date → full-width primary "Cycle ended"
+//   banner — the only path into closeAndStart.
+
+class _CycleStatusStrip extends StatelessWidget {
+  const _CycleStatusStrip();
+
+  void _openTransition(BuildContext context, CycleTransitionMode mode) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => CycleTransitionScreen(mode: mode),
+      fullscreenDialog: true,
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scope = AppScope.of(context);
+    return StreamBuilder<CycleRow?>(
+      stream: scope.cycles.watchActiveCycle(),
+      builder: (context, snap) {
+        final active = snap.data;
+        if (active == null) {
+          return StreamBuilder<bool>(
+            stream: scope.cycles.watchHasAnyCycle(),
+            builder: (context, hasSnap) {
+              final hasAny = hasSnap.data ?? false;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 14),
+                child: _BeginTrackingHero(
+                  hasPriorCycle: hasAny,
+                  onTap: () => _openTransition(
+                    context,
+                    CycleTransitionMode.firstCycle,
+                  ),
+                ),
+              );
+            },
+          );
+        }
+        // A cycle ends when the calendar month changes. The stored
+        // startDate is always the 1st of the cycle's month, so
+        // comparing (year, month) is enough — no need to look at
+        // endDate's day.
+        final now = DateTime.now();
+        final cycleStart = DateTime.fromMillisecondsSinceEpoch(active.startDate);
+        final pastEnd = now.year != cycleStart.year ||
+            now.month != cycleStart.month;
+        if (pastEnd) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 14),
+            child: _CycleEndedBanner(
+              onTap: () => _openTransition(
+                context,
+                CycleTransitionMode.closeAndStart,
+              ),
+            ),
+          );
+        }
+        // Active cycle, still inside its period — header's pill is the
+        // sole progress display, nothing else needs to show here.
+        return const SizedBox.shrink();
+      },
+    );
+  }
+}
+
+class _BeginTrackingHero extends StatelessWidget {
+  const _BeginTrackingHero({
+    required this.hasPriorCycle,
+    required this.onTap,
+  });
+
+  final bool hasPriorCycle;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final range = CycleRepository.proposedNextCycleRange();
+    final monthName = _monthNameFromInt(range.start.month);
+    final startStr = '${_monthAbbrev(range.start.month)} ${range.start.day}';
+    final endStr = '${_monthAbbrev(range.end.month)} ${range.end.day}';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 22, 20, 22),
+      decoration: BoxDecoration(
+        color: CropkeepColors.bgHero,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: CropkeepColors.borderCard, width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.eco_rounded,
+                  size: 22, color: CropkeepColors.greenPrimary),
+              const SizedBox(width: 8),
+              Text(
+                hasPriorCycle ? 'Ready for $monthName' : 'Welcome to Cropkeep',
+                style: const TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 17,
+                  fontWeight: FontWeight.w800,
+                  color: CropkeepColors.textPrimary,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            hasPriorCycle
+                ? 'Your previous cycle is sealed in the harvest history. '
+                    'Begin tracking $monthName when you\'re ready.'
+                : 'Add plots and wells below to map out your spending. '
+                    'Press Begin tracking when you want to start logging '
+                    'transactions against this cycle.',
+            style: const TextStyle(
+              fontFamily: 'Nunito',
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              color: CropkeepColors.textSecondaryOnHero,
+              height: 1.5,
+            ),
+          ),
+          const SizedBox(height: 14),
+          Text(
+            '$startStr – $endStr',
+            style: const TextStyle(
+              fontFamily: 'Nunito',
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              color: CropkeepColors.textGreenDeep,
+            ),
+          ),
+          const SizedBox(height: 14),
+          SizedBox(
+            height: 48,
+            child: ElevatedButton(
+              onPressed: onTap,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: CropkeepColors.greenPrimary,
+                foregroundColor: CropkeepColors.textOnGreenBtn,
+                elevation: 0,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14)),
+                textStyle: const TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              child: const Text('Begin tracking  ▸'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CycleEndedBanner extends StatelessWidget {
+  const _CycleEndedBanner({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: CropkeepColors.greenPrimary,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: const Row(
+            children: [
+              Icon(Icons.eco_rounded,
+                  color: CropkeepColors.textOnGreenBtn, size: 22),
+              SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Cycle ended',
+                      style: TextStyle(
+                        fontFamily: 'Nunito',
+                        fontSize: 15,
+                        fontWeight: FontWeight.w800,
+                        color: CropkeepColors.textOnGreenBtn,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Tap to reconcile transactions and harvest',
+                      style: TextStyle(
+                        fontFamily: 'Nunito',
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: CropkeepColors.textOnGreenBtn,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(Icons.arrow_forward_rounded,
+                  color: CropkeepColors.textOnGreenBtn, size: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+String _monthNameFromInt(int month) {
+  const names = [
+    '',
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ];
+  return names[month];
+}
+
+String _monthAbbrev(int month) {
+  const names = [
+    '',
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ];
+  return names[month];
 }

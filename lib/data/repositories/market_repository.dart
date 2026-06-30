@@ -21,15 +21,6 @@ class AlreadyOwnedException implements Exception {
   String toString() => 'AlreadyOwnedException(itemId: $itemId)';
 }
 
-class PackCapException implements Exception {
-  const PackCapException({required this.itemId, required this.cap});
-  final String itemId;
-  final int cap;
-  @override
-  String toString() =>
-      'PackCapException(itemId: $itemId, cap: $cap)';
-}
-
 class MarketRepository {
   MarketRepository(this._db);
 
@@ -48,16 +39,42 @@ class MarketRepository {
     return _db.select(_db.ownedItems).watch();
   }
 
+  // Crop catalog joined with the user's owned seed-pack stock. The plot
+  // creation picker reads this to decide which tiles to surface: starters
+  // always render with `stock: null`; consumable seed packs render with
+  // the current quantity (0 means "Out of stock" — the tile still shows
+  // so the user knows the crop exists, but selection bounces to the
+  // Market hint per the spec).
+  Stream<List<CropPickerEntry>> watchCropPicker() {
+    final query = _db.select(_db.cropsCatalog).join([
+      leftOuterJoin(
+        _db.ownedItems,
+        _db.ownedItems.itemId.equalsExp(_db.cropsCatalog.cropId),
+      ),
+    ])
+      ..orderBy([
+        OrderingTerm(expression: _db.cropsCatalog.displayOrder),
+        OrderingTerm(expression: _db.cropsCatalog.cropId),
+      ]);
+    return query.watch().map((rows) {
+      return rows.map((row) {
+        final crop = row.readTable(_db.cropsCatalog);
+        final owned = row.readTableOrNull(_db.ownedItems);
+        return CropPickerEntry(
+          crop: crop,
+          stock: crop.isStarter ? null : (owned?.quantity ?? 0),
+        );
+      }).toList(growable: false);
+    });
+  }
+
   // Atomic purchase. Re-reads state inside the transaction so a stale
-  // UI snapshot can't authorise an overdraft, double-buy, or
-  // cap-exceeding restock.
+  // UI snapshot can't authorise an overdraft or double-buy.
   //
   // • `quantityDelta` — for crops: pack size (e.g. 5). For fertilizers:
   //   1. For decorations / avatars / plot colors: 1.
   // • `oneTime = true` rejects re-purchases of cosmetics with an
   //   AlreadyOwnedException.
-  // • `inventoryCap` — non-null only for crops. Rejects buys that would
-  //   push the seed stock above the pack max from shop.md.
   Future<void> purchase({
     required String itemId,
     required OwnedItemType itemType,
@@ -65,7 +82,6 @@ class MarketRepository {
     required int quantityDelta,
     required String description,
     bool oneTime = false,
-    int? inventoryCap,
   }) async {
     final now = DateTime.now().millisecondsSinceEpoch;
     await _db.transaction(() async {
@@ -79,16 +95,12 @@ class MarketRepository {
         );
       }
 
-      final existingOwned = await (_db.select(_db.ownedItems)
-            ..where((t) => t.itemId.equals(itemId)))
-          .getSingleOrNull();
-      if (oneTime && existingOwned != null && existingOwned.quantity > 0) {
-        throw AlreadyOwnedException(itemId);
-      }
-      if (inventoryCap != null) {
-        final current = existingOwned?.quantity ?? 0;
-        if (current + quantityDelta > inventoryCap) {
-          throw PackCapException(itemId: itemId, cap: inventoryCap);
+      if (oneTime) {
+        final existingOwned = await (_db.select(_db.ownedItems)
+              ..where((t) => t.itemId.equals(itemId)))
+            .getSingleOrNull();
+        if (existingOwned != null && existingOwned.quantity > 0) {
+          throw AlreadyOwnedException(itemId);
         }
       }
 
@@ -116,20 +128,35 @@ class MarketRepository {
       // Increment-or-insert the owned_items row. Drift's
       // insertOnConflictUpdate would overwrite quantity instead of
       // adding to it, so we issue an UPSERT directly.
-      await _db.customStatement(
+      //
+      // Use customUpdate (not customStatement) so Drift invalidates
+      // streams watching the owned_items table — customStatement is
+      // documented to skip stream notification, which left the Market
+      // "owned" chips and the Satchel page stuck on stale data until
+      // the screen was rebuilt from scratch.
+      await _db.customUpdate(
         'INSERT INTO owned_items (item_id, item_type, quantity, acquired_at) '
         'VALUES (?, ?, ?, ?) '
         'ON CONFLICT(item_id) DO UPDATE SET '
         'quantity = owned_items.quantity + excluded.quantity',
-        <Object?>[
-          itemId,
-          _ownedItemTypeWire(itemType),
-          quantityDelta,
-          now,
+        variables: [
+          Variable.withString(itemId),
+          Variable.withString(_ownedItemTypeWire(itemType)),
+          Variable.withInt(quantityDelta),
+          Variable.withInt(now),
         ],
+        updates: {_db.ownedItems},
       );
     });
   }
+}
+
+class CropPickerEntry {
+  const CropPickerEntry({required this.crop, required this.stock});
+
+  final CropCatalogRow crop;
+  // null = starter (no inventory concept); 0+ = consumable seed pack count.
+  final int? stock;
 }
 
 // Mirrors `SnakeEnumConverter`'s wire format used by the OwnedItems

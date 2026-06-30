@@ -3,14 +3,18 @@ import 'package:drift/drift.dart';
 import '../../screens/market/market_catalog.dart';
 import '../currency_catalog.dart';
 import '../database.dart';
+import '../pending_rates_store.dart';
+import '../tables/coin_ledger.dart';
 import '../tables/cycles.dart';
 import '../tables/owned_items.dart';
 import '../tables/wells.dart';
 
 class AppSettingsRepository {
-  AppSettingsRepository(this._db);
+  AppSettingsRepository(this._db, {required PendingRatesStore pendingRates})
+      : _pendingRates = pendingRates;
 
   final AppDatabase _db;
+  final PendingRatesStore _pendingRates;
 
   Stream<AppSettingsRow?> watch() {
     return (_db.select(_db.appSettings)..where((t) => t.id.equals(1)))
@@ -21,6 +25,38 @@ class AppSettingsRepository {
     return (_db.update(_db.appSettings)..where((t) => t.id.equals(1))).write(
       AppSettingsCompanion(avatarId: Value(avatarId)),
     );
+  }
+
+  // Debug-only: grants spendable coins for testing the Market without
+  // playing through cycles. Mirrors the production write pattern —
+  // balance bump + matching `manualAdjustment` ledger row in one
+  // transaction so the ledger stays the source of truth. Surfaced from
+  // the Farmer tab's Dev tools card; remove the card (and this method)
+  // before shipping.
+  Future<void> grantCoinsForTesting(int amount) async {
+    await _db.transaction(() async {
+      final settings = await (_db.select(_db.appSettings)
+            ..where((t) => t.id.equals(1)))
+          .getSingle();
+      await (_db.update(_db.appSettings)..where((t) => t.id.equals(1))).write(
+        AppSettingsCompanion(
+          coinsBalance: Value(settings.coinsBalance + amount),
+        ),
+      );
+      final activeCycle = await (_db.select(_db.cycles)
+            ..where((t) => t.state.equalsValue(CycleState.active))
+            ..limit(1))
+          .getSingleOrNull();
+      await _db.into(_db.coinLedger).insert(
+            CoinLedgerCompanion.insert(
+              cycleId: Value(activeCycle?.id),
+              amount: amount,
+              reason: CoinReason.manualAdjustment,
+              description: const Value('Dev tool: granted coins'),
+              occurredAt: DateTime.now().millisecondsSinceEpoch,
+            ),
+          );
+    });
   }
 
   Stream<List<CurrencyRow>> watchCurrencies() {
@@ -73,20 +109,20 @@ class AppSettingsRepository {
     });
   }
 
+  // Onboarding seeds the farm (currencies, plots, wells, starter crops,
+  // savings barn) but does NOT create an active cycle. The user starts
+  // their first cycle explicitly from the Farm tab's "Begin tracking"
+  // CTA — see CycleRepository.startFirstCycle. Exchange rates picked
+  // here are stashed in `_pendingInitialRates` and applied to whichever
+  // cycle the user begins next.
   Future<void> completeOnboarding({
     required String name,
     required String avatarId,
     required String baseCode,
     required Set<String> secondaryCodes,
+    Map<String, double> initialRates = const <String, double>{},
   }) async {
-    final nowDt = DateTime.now();
-    final now = nowDt.millisecondsSinceEpoch;
-    // Cycles always span a single calendar month: 1st → last day. End-date
-    // uses day=0 of the *next* month (Dart treats it as the previous
-    // month's last day) so it remains valid for any month length.
-    final monthStart = DateTime(nowDt.year, nowDt.month, 1).millisecondsSinceEpoch;
-    final monthEnd =
-        DateTime(nowDt.year, nowDt.month + 1, 0).millisecondsSinceEpoch;
+    final now = DateTime.now().millisecondsSinceEpoch;
 
     await _db.transaction(() async {
       await _db.update(_db.currencies).write(
@@ -139,20 +175,6 @@ class AppSettingsRepository {
             );
       }
 
-      final activeCycle = await (_db.select(_db.cycles)
-            ..where((t) => t.state.equalsValue(CycleState.active)))
-          .getSingleOrNull();
-      if (activeCycle == null) {
-        await _db.into(_db.cycles).insert(
-              CyclesCompanion.insert(
-                startDate: monthStart,
-                endDate: monthEnd,
-                state: CycleState.active,
-                createdAt: now,
-              ),
-            );
-      }
-
       final existingUnplanned = await (_db.select(_db.plots)
             ..where((t) => t.isUnplanned.equals(true)))
           .getSingleOrNull();
@@ -192,7 +214,26 @@ class AppSettingsRepository {
               ),
             );
       }
+
     });
+
+    // Onboarding-time rate entries can't be persisted yet — there's no
+    // active cycle to scope them to. Stash them in the disk-backed
+    // pending-rates store so they survive process kill and are usable
+    // by pre-cycle screens (new well / new plot / rates sheet). The
+    // first CycleRepository.startFirstCycle call drains the store via
+    // `consumePendingInitialRates()` into the new cycle's id.
+    if (initialRates.isEmpty) {
+      await _pendingRates.clear();
+    } else {
+      await _pendingRates.replaceAll(initialRates);
+    }
+  }
+
+  // Initial exchange rates the user entered during onboarding. Consumed
+  // once when the first cycle is created. See `completeOnboarding`.
+  Future<Map<String, double>> consumePendingInitialRates() {
+    return _pendingRates.consume();
   }
 
   Future<void> resetAll() async {
@@ -211,7 +252,14 @@ class AppSettingsRepository {
       await _db.delete(_db.plots).go();
       await _db.delete(_db.wells).go();
       await _db.delete(_db.cycles).go();
-      await _db.delete(_db.cropsCatalog).go();
+      // crops_catalog is application-defined (it carries the
+      // definitions of every crop the app supports), not user data —
+      // keep it across reset. Wiping it here previously left the
+      // catalog empty until the next process startup re-ran
+      // ensureSeeded, which crashed the crop picker mid-session.
+      // _resyncConsumableCrops in ensureSeeded is idempotent via
+      // insertOnConflictUpdate, so any catalog drift from app upgrades
+      // self-heals on next launch without needing a reset to scrub it.
 
       await _db.into(_db.currencies).insertOnConflictUpdate(
             CurrenciesCompanion.insert(
@@ -248,6 +296,7 @@ class AppSettingsRepository {
         ),
       );
     });
+    await _pendingRates.clear();
   }
 
   // Onboarding will overwrite the placeholder name/avatar/currency.
@@ -269,6 +318,7 @@ class AppSettingsRepository {
 
     await _resyncCurrencyCatalog();
     await _resyncConsumableCrops();
+    await _migrateLegacyAvatarId();
 
     final existingSettings = await (_db.select(_db.appSettings)
           ..where((t) => t.id.equals(1)))
@@ -297,32 +347,6 @@ class AppSettingsRepository {
           );
     }
 
-    await _healActiveCycleToMonth();
-  }
-
-  // Pre-rule onboarding created the active cycle as `now → now + 30d`. The
-  // rule is now: cycles always span a single calendar month. Heal any
-  // active cycle whose dates don't match by snapping to the month its
-  // original start date fell in. Cycle id, transactions, and incomes stay
-  // bound to the same row; only the date metadata moves.
-  Future<void> _healActiveCycleToMonth() async {
-    final active = await (_db.select(_db.cycles)
-          ..where((t) => t.state.equalsValue(CycleState.active)))
-        .getSingleOrNull();
-    if (active == null) return;
-    final start = DateTime.fromMillisecondsSinceEpoch(active.startDate);
-    final expectedStart = DateTime(start.year, start.month, 1);
-    final expectedEnd = DateTime(start.year, start.month + 1, 0);
-    if (active.startDate == expectedStart.millisecondsSinceEpoch &&
-        active.endDate == expectedEnd.millisecondsSinceEpoch) {
-      return;
-    }
-    await (_db.update(_db.cycles)..where((t) => t.id.equals(active.id))).write(
-      CyclesCompanion(
-        startDate: Value(expectedStart.millisecondsSinceEpoch),
-        endDate: Value(expectedEnd.millisecondsSinceEpoch),
-      ),
-    );
   }
 
   // Seeds the 15 consumable seed-pack crops driven by `MarketCatalog`.
@@ -348,6 +372,20 @@ class AppSettingsRepository {
             ),
           );
     }
+  }
+
+  // Resets any install carrying the dropped `farmer-fl` avatar id back
+  // to the default `farmer`. The legacy id was a hardcoded second option
+  // in the old onboarding flow; it has no `MarketCatalog.avatars` entry,
+  // so the picker would render the fallback farmer SVG and never show
+  // the avatar as equipped. Idempotent — no-op on fresh installs and on
+  // installs that have already migrated.
+  Future<void> _migrateLegacyAvatarId() async {
+    await (_db.update(_db.appSettings)
+          ..where(
+            (t) => t.id.equals(1) & t.avatarId.equals('farmer-fl'),
+          ))
+        .write(const AppSettingsCompanion(avatarId: Value('farmer')));
   }
 
   // Pulls catalog-managed fields (symbol/name/decimalPlaces) forward onto
