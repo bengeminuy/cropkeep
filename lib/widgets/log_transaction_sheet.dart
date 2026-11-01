@@ -9,6 +9,7 @@ import '../app_scope.dart';
 import '../data/currency_catalog.dart';
 import '../data/database.dart';
 import '../data/tables/cycles.dart' show CycleState;
+import '../data/tables/plots.dart' show PlotKind;
 import '../data/tables/wells.dart' show WellType;
 import '../theme/colors.dart';
 import '../theme/plot_swatches.dart';
@@ -440,6 +441,7 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
                               plots: data.plotsSorted,
                               unplannedId: data.unplannedPlot?.id,
                               selectedId: _selectedPlotId,
+                              plotLastUsed: data.plotLastUsed,
                               onSelect: (id) =>
                                   setState(() => _selectedPlotId = id),
                             )
@@ -447,6 +449,7 @@ class _LogTransactionSheetState extends State<LogTransactionSheet> {
                       _WellChips(
                         wells: data.wellsSorted,
                         selectedId: _selectedWellId,
+                        wellLastUsed: data.wellLastUsed,
                         onSelect: (id) =>
                             setState(() => _selectedWellId = id),
                       ),
@@ -513,6 +516,8 @@ class _LogSheetData {
     required this.plotsSorted,
     required this.wellsSorted,
     required this.unplannedPlot,
+    required this.plotLastUsed,
+    required this.wellLastUsed,
   });
 
   final CycleRow activeCycle;
@@ -525,6 +530,11 @@ class _LogSheetData {
   final List<PlotRow> plotsSorted;
   final List<WellRow> wellsSorted;
   final PlotRow? unplannedPlot;
+  // plotId → most recent transaction createdAt (epoch ms). Missing keys
+  // mean the plot has never been used. Powers the "recents first" chip
+  // row and the ranking inside the browse-all sheet.
+  final Map<int, int> plotLastUsed;
+  final Map<int, int> wellLastUsed;
 
   PlotRow? plotById(int id) {
     for (final p in plotsSorted) {
@@ -580,13 +590,42 @@ Stream<_LogSheetData> _watchLogSheetData(AppDatabase db) {
         ]))
       .watch();
   final rates = db.select(db.exchangeRates).watch();
+  // Recency is derived, not stored: MAX(createdAt) per plot/well over
+  // live (non-deleted) rows. Uses createdAt (log timestamp) rather than
+  // spentAt/receivedAt so a backdated entry from a week ago doesn't
+  // pretend the plot is "not recently used".
+  final plotRecency = db
+      .customSelect(
+        'SELECT plot_id, MAX(created_at) AS last_used '
+        'FROM transactions WHERE deleted_at IS NULL GROUP BY plot_id',
+        readsFrom: {db.transactions},
+      )
+      .watch()
+      .map((rows) => <int, int>{
+            for (final r in rows)
+              r.data['plot_id'] as int: r.data['last_used'] as int,
+          });
+  final wellRecency = db
+      .customSelect(
+        'SELECT well_id, MAX(created_at) AS last_used '
+        'FROM income_entries WHERE deleted_at IS NULL GROUP BY well_id',
+        readsFrom: {db.incomeEntries},
+      )
+      .watch()
+      .map((rows) => <int, int>{
+            for (final r in rows)
+              r.data['well_id'] as int: r.data['last_used'] as int,
+          });
 
-  return _combine5(activeCycle, currencies, plots, wells, rates, (
+  return _combine7(activeCycle, currencies, plots, wells, rates,
+      plotRecency, wellRecency, (
     CycleRow? cycle,
     List<CurrencyRow> curs,
     List<PlotRow> ps,
     List<WellRow> ws,
     List<ExchangeRateRow> rs,
+    Map<int, int> plotLastUsed,
+    Map<int, int> wellLastUsed,
   ) {
     if (cycle == null || curs.isEmpty) return null;
     final base = curs.firstWhere(
@@ -613,17 +652,21 @@ Stream<_LogSheetData> _watchLogSheetData(AppDatabase db) {
             ? throw StateError('No plots in database')
             : ps.first,
       ),
+      plotLastUsed: plotLastUsed,
+      wellLastUsed: wellLastUsed,
     );
   }).where((d) => d != null).cast<_LogSheetData>();
 }
 
-Stream<R> _combine5<A, B, C, D, E, R>(
+Stream<R> _combine7<A, B, C, D, E, F, G, R>(
   Stream<A> a,
   Stream<B> b,
   Stream<C> c,
   Stream<D> d,
   Stream<E> e,
-  R Function(A, B, C, D, E) combiner,
+  Stream<F> f,
+  Stream<G> g,
+  R Function(A, B, C, D, E, F, G) combiner,
 ) {
   late StreamController<R> controller;
   A? va;
@@ -631,16 +674,28 @@ Stream<R> _combine5<A, B, C, D, E, R>(
   C? vc;
   D? vd;
   E? ve;
+  F? vf;
+  G? vg;
   bool ha = false;
   bool hb = false;
   bool hc = false;
   bool hd = false;
   bool he = false;
+  bool hf = false;
+  bool hg = false;
   final subs = <StreamSubscription<dynamic>>[];
 
   void maybeEmit() {
-    if (ha && hb && hc && hd && he) {
-      controller.add(combiner(va as A, vb as B, vc as C, vd as D, ve as E));
+    if (ha && hb && hc && hd && he && hf && hg) {
+      controller.add(combiner(
+        va as A,
+        vb as B,
+        vc as C,
+        vd as D,
+        ve as E,
+        vf as F,
+        vg as G,
+      ));
     }
   }
 
@@ -669,6 +724,16 @@ Stream<R> _combine5<A, B, C, D, E, R>(
       subs.add(e.listen((v) {
         ve = v;
         he = true;
+        maybeEmit();
+      }, onError: controller.addError));
+      subs.add(f.listen((v) {
+        vf = v;
+        hf = true;
+        maybeEmit();
+      }, onError: controller.addError));
+      subs.add(g.listen((v) {
+        vg = v;
+        hg = true;
         maybeEmit();
       }, onError: controller.addError));
     },
@@ -1059,51 +1124,141 @@ class _PillButton extends StatelessWidget {
 
 // ──────────────────────────────────────────────────────────────────────────
 // Plot chips (expense mode) — same swatch-dot + name pattern the Ledger
-// + filter sheet use. Trailing "+ New plot" chip launches the inline
-// creation flow (placeholder snackbar for now).
+// + filter sheet use.
+//
+// Below the inline-threshold (5 plots), we show every plot as a wrap —
+// same behavior as before. Above it, we switch to a recents-first row:
+// top 3 by MAX(createdAt), the pinned Unplanned chip, then a "More…"
+// chip that opens the browse-all sheet. The currently selected plot is
+// always kept visible even if it's not in the top 3 — otherwise the row
+// would silently drop the user's own choice.
+
+const int _inlineChipThreshold = 5;
 
 class _PlotChips extends StatelessWidget {
   const _PlotChips({
     required this.plots,
     required this.unplannedId,
     required this.selectedId,
+    required this.plotLastUsed,
     required this.onSelect,
   });
 
   final List<PlotRow> plots;
   final int? unplannedId;
   final int? selectedId;
+  final Map<int, int> plotLastUsed;
   final ValueChanged<int> onSelect;
 
   @override
   Widget build(BuildContext context) {
+    if (plots.length <= _inlineChipThreshold) {
+      return Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (final p in plots)
+            _SourceChip(
+              label: p.name,
+              selected: p.id == selectedId,
+              leading: _PlotSwatchDot(colorId: p.plotColorId),
+              onTap: () => onSelect(p.id),
+            ),
+        ],
+      );
+    }
+
+    final unplanned = unplannedId == null
+        ? null
+        : plots.firstWhere(
+            (p) => p.id == unplannedId,
+            orElse: () => plots.first,
+          );
+    // Rank everything except Unplanned by recency, then displayOrder for
+    // ties (unranked plots still land in a stable order).
+    final ranked = plots
+        .where((p) => p.id != unplannedId)
+        .toList()
+      ..sort((a, b) {
+        final ta = plotLastUsed[a.id];
+        final tb = plotLastUsed[b.id];
+        if (ta != null && tb != null) return tb.compareTo(ta);
+        if (ta != null) return -1;
+        if (tb != null) return 1;
+        return a.displayOrder.compareTo(b.displayOrder);
+      });
+    const slots = 3;
+    final topRecents = ranked.take(slots).toList();
+    // If the user has already picked a plot outside the top slots, hoist
+    // it into the row so the selection stays visible when the sheet
+    // closes and the row rebuilds.
+    PlotRow? pinnedSelected;
+    if (selectedId != null &&
+        selectedId != unplannedId &&
+        !topRecents.any((p) => p.id == selectedId)) {
+      pinnedSelected = plots.firstWhere(
+        (p) => p.id == selectedId,
+        orElse: () => plots.first,
+      );
+    }
+
     return Wrap(
       spacing: 8,
       runSpacing: 8,
       children: [
-        for (final p in plots)
+        if (pinnedSelected != null)
+          _SourceChip(
+            label: pinnedSelected.name,
+            selected: true,
+            leading: _PlotSwatchDot(colorId: pinnedSelected.plotColorId),
+            onTap: () => onSelect(pinnedSelected!.id),
+          ),
+        for (final p in topRecents)
           _SourceChip(
             label: p.name,
             selected: p.id == selectedId,
             leading: _PlotSwatchDot(colorId: p.plotColorId),
             onTap: () => onSelect(p.id),
           ),
+        if (unplanned != null)
+          _SourceChip(
+            label: unplanned.name,
+            selected: unplanned.id == selectedId,
+            leading: _PlotSwatchDot(colorId: unplanned.plotColorId),
+            onTap: () => onSelect(unplanned.id),
+          ),
+        _MoreChip(
+          onTap: () async {
+            final picked = await _showPlotPickerSheet(
+              context: context,
+              plots: plots,
+              selectedId: selectedId,
+              unplannedId: unplannedId,
+              plotLastUsed: plotLastUsed,
+            );
+            if (picked != null) onSelect(picked);
+          },
+        ),
       ],
     );
   }
 }
 
-// Well chips (income mode) — grouped by foundation vs bonus.
+// Well chips (income mode) — grouped by foundation vs bonus when the
+// total fits inline. Above the threshold we switch to the same
+// recency-first row + More… sheet the plot picker uses.
 
 class _WellChips extends StatelessWidget {
   const _WellChips({
     required this.wells,
     required this.selectedId,
+    required this.wellLastUsed,
     required this.onSelect,
   });
 
   final List<WellRow> wells;
   final int? selectedId;
+  final Map<int, int> wellLastUsed;
   final ValueChanged<int> onSelect;
 
   @override
@@ -1111,51 +1266,718 @@ class _WellChips extends StatelessWidget {
     // Carryover is system-managed — the only writer is the cycle-close
     // rollover, never user input. Hide it from the picker entirely so
     // it doesn't read as an option the user is meant to consider.
-    final foundation = wells
-        .where((w) => w.wellType == WellType.foundation && !w.isCarryover)
-        .toList();
-    final bonus = wells
-        .where((w) => w.wellType == WellType.bonus && !w.isCarryover)
-        .toList();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    final visible = wells.where((w) => !w.isCarryover).toList();
+    if (visible.length <= _inlineChipThreshold) {
+      final foundation = visible
+          .where((w) => w.wellType == WellType.foundation)
+          .toList();
+      final bonus =
+          visible.where((w) => w.wellType == WellType.bonus).toList();
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (foundation.isNotEmpty) ...[
+            _SubEyebrow('Foundation'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final w in foundation)
+                  _SourceChip(
+                    label: w.name,
+                    selected: w.id == selectedId,
+                    leading: _WellIconGlyph(iconId: w.wellIconId),
+                    onTap: () => onSelect(w.id),
+                  ),
+              ],
+            ),
+          ],
+          if (bonus.isNotEmpty) ...[
+            if (foundation.isNotEmpty) const SizedBox(height: 14),
+            _SubEyebrow('Bonus'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final w in bonus)
+                  _SourceChip(
+                    label: w.name,
+                    selected: w.id == selectedId,
+                    leading: _WellIconGlyph(iconId: w.wellIconId),
+                    onTap: () => onSelect(w.id),
+                  ),
+              ],
+            ),
+          ],
+        ],
+      );
+    }
+
+    final ranked = visible.toList()
+      ..sort((a, b) {
+        final ta = wellLastUsed[a.id];
+        final tb = wellLastUsed[b.id];
+        if (ta != null && tb != null) return tb.compareTo(ta);
+        if (ta != null) return -1;
+        if (tb != null) return 1;
+        return a.displayOrder.compareTo(b.displayOrder);
+      });
+    const slots = 4;
+    final topRecents = ranked.take(slots).toList();
+    WellRow? pinnedSelected;
+    if (selectedId != null &&
+        !topRecents.any((w) => w.id == selectedId)) {
+      pinnedSelected = visible.firstWhere(
+        (w) => w.id == selectedId,
+        orElse: () => visible.first,
+      );
+    }
+
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
       children: [
-        if (foundation.isNotEmpty) ...[
-          _SubEyebrow('Foundation'),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final w in foundation)
-                _SourceChip(
-                  label: w.name,
-                  selected: w.id == selectedId,
-                  leading: _WellIconGlyph(iconId: w.wellIconId),
-                  onTap: () => onSelect(w.id),
-                ),
-            ],
+        if (pinnedSelected != null)
+          _SourceChip(
+            label: pinnedSelected.name,
+            selected: true,
+            leading: _WellIconGlyph(iconId: pinnedSelected.wellIconId),
+            onTap: () => onSelect(pinnedSelected!.id),
           ),
-        ],
-        if (bonus.isNotEmpty) ...[
-          if (foundation.isNotEmpty) const SizedBox(height: 14),
-          _SubEyebrow('Bonus'),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final w in bonus)
-                _SourceChip(
-                  label: w.name,
-                  selected: w.id == selectedId,
-                  leading: _WellIconGlyph(iconId: w.wellIconId),
-                  onTap: () => onSelect(w.id),
-                ),
-            ],
+        for (final w in topRecents)
+          _SourceChip(
+            label: w.name,
+            selected: w.id == selectedId,
+            leading: _WellIconGlyph(iconId: w.wellIconId),
+            onTap: () => onSelect(w.id),
           ),
-        ],
+        _MoreChip(
+          onTap: () async {
+            final picked = await _showWellPickerSheet(
+              context: context,
+              wells: visible,
+              selectedId: selectedId,
+              wellLastUsed: wellLastUsed,
+            );
+            if (picked != null) onSelect(picked);
+          },
+        ),
       ],
+    );
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Browse-all pickers — modal bottom sheet with a search field at the top
+// and grouped rows below (plot kind for expenses, foundation/bonus for
+// wells). Opened from the "More…" chip in the recents row.
+
+Future<int?> _showPlotPickerSheet({
+  required BuildContext context,
+  required List<PlotRow> plots,
+  required int? selectedId,
+  required int? unplannedId,
+  required Map<int, int> plotLastUsed,
+}) {
+  return showModalBottomSheet<int>(
+    context: context,
+    backgroundColor: CropkeepColors.bgScreen,
+    isScrollControlled: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+    ),
+    builder: (sheetContext) => _PlotPickerSheet(
+      plots: plots,
+      selectedId: selectedId,
+      unplannedId: unplannedId,
+      plotLastUsed: plotLastUsed,
+    ),
+  );
+}
+
+Future<int?> _showWellPickerSheet({
+  required BuildContext context,
+  required List<WellRow> wells,
+  required int? selectedId,
+  required Map<int, int> wellLastUsed,
+}) {
+  return showModalBottomSheet<int>(
+    context: context,
+    backgroundColor: CropkeepColors.bgScreen,
+    isScrollControlled: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+    ),
+    builder: (sheetContext) => _WellPickerSheet(
+      wells: wells,
+      selectedId: selectedId,
+      wellLastUsed: wellLastUsed,
+    ),
+  );
+}
+
+class _PlotPickerSheet extends StatefulWidget {
+  const _PlotPickerSheet({
+    required this.plots,
+    required this.selectedId,
+    required this.unplannedId,
+    required this.plotLastUsed,
+  });
+
+  final List<PlotRow> plots;
+  final int? selectedId;
+  final int? unplannedId;
+  final Map<int, int> plotLastUsed;
+
+  @override
+  State<_PlotPickerSheet> createState() => _PlotPickerSheetState();
+}
+
+class _PlotPickerSheetState extends State<_PlotPickerSheet> {
+  final TextEditingController _search = TextEditingController();
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _search.addListener(() {
+      final next = _search.text.trim().toLowerCase();
+      if (next != _query) setState(() => _query = next);
+    });
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final filtered = _query.isEmpty
+        ? widget.plots
+        : widget.plots
+            .where((p) => p.name.toLowerCase().contains(_query))
+            .toList();
+    // Sort within-group by recency, then displayOrder — matches how the
+    // recents row ranks, so users see the same ordering conventions.
+    int rank(PlotRow a, PlotRow b) {
+      final ta = widget.plotLastUsed[a.id];
+      final tb = widget.plotLastUsed[b.id];
+      if (ta != null && tb != null) return tb.compareTo(ta);
+      if (ta != null) return -1;
+      if (tb != null) return 1;
+      return a.displayOrder.compareTo(b.displayOrder);
+    }
+
+    final fixedObligations = filtered
+        .where((p) => p.kind == PlotKind.fixedObligation)
+        .toList()
+      ..sort(rank);
+    final discretionary = filtered
+        .where((p) => p.kind == PlotKind.discretionary && !p.isUnplanned)
+        .toList()
+      ..sort(rank);
+    final investments = filtered
+        .where((p) => p.kind == PlotKind.investment)
+        .toList()
+      ..sort(rank);
+    // Unplanned always sits at the very top of the discretionary group
+    // so it never disappears when the list is long.
+    final unplanned = filtered
+        .where((p) => p.isUnplanned)
+        .toList()
+      ..sort(rank);
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: EdgeInsets.only(bottom: media.viewInsets.bottom),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: media.size.height * 0.78),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _SheetHandle(),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(20, 2, 20, 12),
+                child: Text(
+                  'Choose a plot',
+                  style: TextStyle(
+                    fontFamily: 'Nunito',
+                    fontSize: 17,
+                    fontWeight: FontWeight.w800,
+                    color: CropkeepColors.textPrimary,
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+                child: _SearchField(
+                  controller: _search,
+                  hint: 'Search plots',
+                ),
+              ),
+              Expanded(
+                child: _PickerList(
+                  isEmpty: filtered.isEmpty,
+                  emptyMessage: 'No plots match "${_search.text.trim()}".',
+                  children: [
+                    if (unplanned.isNotEmpty || discretionary.isNotEmpty)
+                      _PickerGroup(
+                        label: 'Discretionary',
+                        children: [
+                          for (final p in unplanned)
+                            _PlotPickerRow(
+                              plot: p,
+                              selected: p.id == widget.selectedId,
+                              onTap: () =>
+                                  Navigator.of(context).pop(p.id),
+                            ),
+                          for (final p in discretionary)
+                            _PlotPickerRow(
+                              plot: p,
+                              selected: p.id == widget.selectedId,
+                              onTap: () =>
+                                  Navigator.of(context).pop(p.id),
+                            ),
+                        ],
+                      ),
+                    if (fixedObligations.isNotEmpty)
+                      _PickerGroup(
+                        label: 'Fixed obligations',
+                        children: [
+                          for (final p in fixedObligations)
+                            _PlotPickerRow(
+                              plot: p,
+                              selected: p.id == widget.selectedId,
+                              onTap: () =>
+                                  Navigator.of(context).pop(p.id),
+                            ),
+                        ],
+                      ),
+                    if (investments.isNotEmpty)
+                      _PickerGroup(
+                        label: 'Investments',
+                        children: [
+                          for (final p in investments)
+                            _PlotPickerRow(
+                              plot: p,
+                              selected: p.id == widget.selectedId,
+                              onTap: () =>
+                                  Navigator.of(context).pop(p.id),
+                            ),
+                        ],
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WellPickerSheet extends StatefulWidget {
+  const _WellPickerSheet({
+    required this.wells,
+    required this.selectedId,
+    required this.wellLastUsed,
+  });
+
+  final List<WellRow> wells;
+  final int? selectedId;
+  final Map<int, int> wellLastUsed;
+
+  @override
+  State<_WellPickerSheet> createState() => _WellPickerSheetState();
+}
+
+class _WellPickerSheetState extends State<_WellPickerSheet> {
+  final TextEditingController _search = TextEditingController();
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _search.addListener(() {
+      final next = _search.text.trim().toLowerCase();
+      if (next != _query) setState(() => _query = next);
+    });
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final filtered = _query.isEmpty
+        ? widget.wells
+        : widget.wells
+            .where((w) => w.name.toLowerCase().contains(_query))
+            .toList();
+    int rank(WellRow a, WellRow b) {
+      final ta = widget.wellLastUsed[a.id];
+      final tb = widget.wellLastUsed[b.id];
+      if (ta != null && tb != null) return tb.compareTo(ta);
+      if (ta != null) return -1;
+      if (tb != null) return 1;
+      return a.displayOrder.compareTo(b.displayOrder);
+    }
+
+    final foundation = filtered
+        .where((w) => w.wellType == WellType.foundation)
+        .toList()
+      ..sort(rank);
+    final bonus = filtered
+        .where((w) => w.wellType == WellType.bonus)
+        .toList()
+      ..sort(rank);
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: EdgeInsets.only(bottom: media.viewInsets.bottom),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: media.size.height * 0.78),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _SheetHandle(),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(20, 2, 20, 12),
+                child: Text(
+                  'Choose a well',
+                  style: TextStyle(
+                    fontFamily: 'Nunito',
+                    fontSize: 17,
+                    fontWeight: FontWeight.w800,
+                    color: CropkeepColors.textPrimary,
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+                child: _SearchField(
+                  controller: _search,
+                  hint: 'Search wells',
+                ),
+              ),
+              Expanded(
+                child: _PickerList(
+                  isEmpty: filtered.isEmpty,
+                  emptyMessage: 'No wells match "${_search.text.trim()}".',
+                  children: [
+                    if (foundation.isNotEmpty)
+                      _PickerGroup(
+                        label: 'Foundation',
+                        children: [
+                          for (final w in foundation)
+                            _WellPickerRow(
+                              well: w,
+                              selected: w.id == widget.selectedId,
+                              onTap: () =>
+                                  Navigator.of(context).pop(w.id),
+                            ),
+                        ],
+                      ),
+                    if (bonus.isNotEmpty)
+                      _PickerGroup(
+                        label: 'Bonus',
+                        children: [
+                          for (final w in bonus)
+                            _WellPickerRow(
+                              well: w,
+                              selected: w.id == widget.selectedId,
+                              onTap: () =>
+                                  Navigator.of(context).pop(w.id),
+                            ),
+                        ],
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SearchField extends StatelessWidget {
+  const _SearchField({required this.controller, required this.hint});
+  final TextEditingController controller;
+  final String hint;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: CropkeepColors.borderCard, width: 1),
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.search_rounded,
+            size: 18,
+            color: CropkeepColors.textSecondary,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: TextField(
+              controller: controller,
+              textInputAction: TextInputAction.search,
+              style: const TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: CropkeepColors.textPrimary,
+                height: 1.2,
+              ),
+              cursorColor: CropkeepColors.greenPrimary,
+              decoration: InputDecoration(
+                isDense: true,
+                border: InputBorder.none,
+                hintText: hint,
+                hintStyle: const TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  color: CropkeepColors.textSecondary,
+                ),
+                contentPadding: EdgeInsets.zero,
+              ),
+            ),
+          ),
+          if (controller.text.isNotEmpty)
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => controller.clear(),
+              child: const Padding(
+                padding: EdgeInsets.only(left: 6),
+                child: Icon(
+                  Icons.close_rounded,
+                  size: 16,
+                  color: CropkeepColors.textSecondary,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PickerList extends StatelessWidget {
+  const _PickerList({
+    required this.isEmpty,
+    required this.emptyMessage,
+    required this.children,
+  });
+
+  final bool isEmpty;
+  final String emptyMessage;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    if (isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+        child: Text(
+          emptyMessage,
+          style: const TextStyle(
+            fontFamily: 'Nunito',
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            color: CropkeepColors.textSecondary,
+            height: 1.3,
+          ),
+        ),
+      );
+    }
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+      children: children,
+    );
+  }
+}
+
+class _PickerGroup extends StatelessWidget {
+  const _PickerGroup({required this.label, required this.children});
+  final String label;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4, left: 2),
+            child: _SubEyebrow(label),
+          ),
+          ...children,
+        ],
+      ),
+    );
+  }
+}
+
+class _PlotPickerRow extends StatelessWidget {
+  const _PlotPickerRow({
+    required this.plot,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final PlotRow plot;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return _PickerRow(
+      selected: selected,
+      leading: _PlotSwatchDot(colorId: plot.plotColorId),
+      label: plot.name,
+      onTap: onTap,
+    );
+  }
+}
+
+class _WellPickerRow extends StatelessWidget {
+  const _WellPickerRow({
+    required this.well,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final WellRow well;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return _PickerRow(
+      selected: selected,
+      leading: _WellIconGlyph(iconId: well.wellIconId),
+      label: well.name,
+      onTap: onTap,
+    );
+  }
+}
+
+class _PickerRow extends StatelessWidget {
+  const _PickerRow({
+    required this.selected,
+    required this.leading,
+    required this.label,
+    required this.onTap,
+  });
+
+  final bool selected;
+  final Widget leading;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+        child: Row(
+          children: [
+            SizedBox(width: 16, child: Center(child: leading)),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontFamily: 'Nunito',
+                  fontSize: 14,
+                  fontWeight: selected ? FontWeight.w800 : FontWeight.w700,
+                  color: selected
+                      ? CropkeepColors.textGreenDeep
+                      : CropkeepColors.textPrimary,
+                  height: 1.2,
+                ),
+              ),
+            ),
+            if (selected)
+              const Icon(
+                Icons.check_rounded,
+                size: 18,
+                color: CropkeepColors.greenPrimary,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// The "More…" chip is intentionally styled a shade lighter than the
+// primary source chips so the recents feel like the emphasised path
+// and the browse-all is a quieter escape hatch.
+class _MoreChip extends StatelessWidget {
+  const _MoreChip({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: CropkeepColors.bgPageAlt,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: CropkeepColors.borderDivider,
+            width: 1,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: const [
+            Text(
+              'More',
+              style: TextStyle(
+                fontFamily: 'Nunito',
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+                color: CropkeepColors.textSecondary,
+                height: 1.1,
+              ),
+            ),
+            SizedBox(width: 4),
+            Icon(
+              Icons.keyboard_arrow_down_rounded,
+              size: 16,
+              color: CropkeepColors.textSecondary,
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

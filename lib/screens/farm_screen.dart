@@ -335,6 +335,7 @@ String? _statusLabelFor(_PlotKind kind, _PlotVisualState state, int? dueDay) {
 _SamplePlot _plotVmFromRow(
   PlotRow row, {
   required int spent,
+  required int spentToday,
   required int totalIncome,
   required _BaseConverter converter,
 }) {
@@ -356,6 +357,7 @@ _SamplePlot _plotVmFromRow(
     iconAsset: _cropIconForCropId(row.cropTypeId),
     budget: budgetBase,
     spent: spent,
+    spentToday: spentToday,
     state: state,
     kind: kind,
     swatch: _plotSwatchFor(row),
@@ -469,6 +471,7 @@ class _FarmDashboard {
   const _FarmDashboard({
     required this.plots,
     required this.plotSpends,
+    required this.plotSpendsToday,
     required this.foundationWells,
     required this.bonusWells,
     required this.wellLogged,
@@ -483,6 +486,10 @@ class _FarmDashboard {
 
   final List<PlotRow> plots;
   final Map<int, int> plotSpends;
+  // plotId → sum of today's non-deleted transactions (base minor).
+  // Missing key means zero. Used by the discretionary status line to
+  // split "left today" from the underlying per-day pace.
+  final Map<int, int> plotSpendsToday;
   final List<WellRow> foundationWells;
   final List<WellRow> bonusWells;
   final Map<int, int> wellLogged;
@@ -555,36 +562,47 @@ class _FarmDataBuilder extends StatelessWidget {
                         return StreamBuilder<Map<int, int>>(
                           stream: cycleId == null
                               ? Stream<Map<int, int>>.value(const {})
-                              : scope.incomeEntries
-                                  .watchLoggedByWellAndCycle(cycleId),
-                          builder: (context, loggedSnap) {
-                            final wellLogged =
-                                loggedSnap.data ?? const <int, int>{};
-                            return StreamBuilder<
-                                List<PlotFertilizerApplicationRow>>(
+                              : scope.transactions
+                                  .watchPlotSpentTodayByCycle(cycleId),
+                          builder: (context, todaySnap) {
+                            final plotSpendsToday =
+                                todaySnap.data ?? const <int, int>{};
+                            return StreamBuilder<Map<int, int>>(
                               stream: cycleId == null
-                                  ? Stream<List<
-                                          PlotFertilizerApplicationRow>>.value(
-                                      const [])
-                                  : scope.fertilizers.watchByCycle(cycleId),
-                              builder: (context, fertSnap) {
-                                final fertList = fertSnap.data ??
-                                    const <PlotFertilizerApplicationRow>[];
-                                final fertilizersByPlot = <int, String>{
-                                  for (final f in fertList)
-                                    f.plotId: f.fertilizerItemId,
-                                };
-                                return _composeDashboard(
-                                  plots: plots,
-                                  wells: wells,
-                                  plotSpends: plotSpends,
-                                  wellLogged: wellLogged,
-                                  currencies: currencies,
-                                  rateToBase: rateToBase,
-                                  base: base,
-                                  fertilizersByPlot: fertilizersByPlot,
-                                  builder: builder,
-                                  context: context,
+                                  ? Stream<Map<int, int>>.value(const {})
+                                  : scope.incomeEntries
+                                      .watchLoggedByWellAndCycle(cycleId),
+                              builder: (context, loggedSnap) {
+                                final wellLogged =
+                                    loggedSnap.data ?? const <int, int>{};
+                                return StreamBuilder<
+                                    List<PlotFertilizerApplicationRow>>(
+                                  stream: cycleId == null
+                                      ? Stream<List<
+                                              PlotFertilizerApplicationRow>>.value(
+                                          const [])
+                                      : scope.fertilizers.watchByCycle(cycleId),
+                                  builder: (context, fertSnap) {
+                                    final fertList = fertSnap.data ??
+                                        const <PlotFertilizerApplicationRow>[];
+                                    final fertilizersByPlot = <int, String>{
+                                      for (final f in fertList)
+                                        f.plotId: f.fertilizerItemId,
+                                    };
+                                    return _composeDashboard(
+                                      plots: plots,
+                                      wells: wells,
+                                      plotSpends: plotSpends,
+                                      plotSpendsToday: plotSpendsToday,
+                                      wellLogged: wellLogged,
+                                      currencies: currencies,
+                                      rateToBase: rateToBase,
+                                      base: base,
+                                      fertilizersByPlot: fertilizersByPlot,
+                                      builder: builder,
+                                      context: context,
+                                    );
+                                  },
                                 );
                               },
                             );
@@ -606,6 +624,7 @@ class _FarmDataBuilder extends StatelessWidget {
     required List<PlotRow> plots,
     required List<WellRow> wells,
     required Map<int, int> plotSpends,
+    required Map<int, int> plotSpendsToday,
     required Map<int, int> wellLogged,
     required List<CurrencyRow> currencies,
     required Map<String, double> rateToBase,
@@ -658,6 +677,7 @@ class _FarmDataBuilder extends StatelessWidget {
       _FarmDashboard(
         plots: plots,
         plotSpends: plotSpends,
+        plotSpendsToday: plotSpendsToday,
         foundationWells: foundation,
         bonusWells: bonus,
         wellLogged: wellLogged,
@@ -857,6 +877,7 @@ class _CropsSubpageState extends State<_CropsSubpage> {
               _plotVmFromRow(
                 row,
                 spent: data.plotSpends[row.id] ?? 0,
+                spentToday: data.plotSpendsToday[row.id] ?? 0,
                 totalIncome: data.totalIncome,
                 converter: data.converter,
               ),
@@ -1877,18 +1898,32 @@ class _PlotRow extends StatelessWidget {
             '$pct% of ${_formatMoney(target, cur.symbol, cur.decimals)} target';
       }
     } else {
-      // Discretionary plots show pace as long as there's budget left to
-      // spend — it's the actionable daily target. Once spent ≥ budget the
-      // pace is meaningless (zero or negative remaining ÷ days), so fall
-      // back to the qualitative state.
+      // Discretionary plots frame pace as "how much can I still spend
+      // today?" rather than "what's the average /day going forward?".
+      // The daily target is derived from budget minus everything spent
+      // *before* today, divided by days remaining (today included). That
+      // baseline stays stable as the user logs today's transactions —
+      // only "left today" moves. Tomorrow's rebuild recomputes from the
+      // new remaining balance, so any overshoot naturally rolls forward.
+      //
+      // If pre-today spend already met or exceeded the budget the plot
+      // has genuinely withered — no meaningful daily target exists.
       final int budget = plot.budget ?? 0;
-      final int remaining = budget - plot.spent;
-      if (remaining > 0) {
-        final daysLeft = _CycleScope.of(context).daysLeft;
-        final pace = remaining ~/ daysLeft;
-        text = '≈${_formatMoney(pace, cur.symbol, cur.decimals)}/day to stay on track';
-      } else {
+      final int spentBeforeToday = plot.spent - plot.spentToday;
+      final int remainingBeforeToday = budget - spentBeforeToday;
+      if (remainingBeforeToday <= 0) {
         text = 'Withering';
+      } else {
+        final daysLeft = _CycleScope.of(context).daysLeft;
+        final int dailyTarget = remainingBeforeToday ~/ daysLeft;
+        final int leftToday = dailyTarget - plot.spentToday;
+        if (leftToday >= 0) {
+          text =
+              '≈${_formatMoney(leftToday, cur.symbol, cur.decimals)} left today';
+        } else {
+          text =
+              '≈${_formatMoney(-leftToday, cur.symbol, cur.decimals)} over today';
+        }
       }
     }
     return Text(
@@ -2792,6 +2827,7 @@ class _SamplePlot {
     required this.iconAsset,
     required this.budget,
     required this.spent,
+    required this.spentToday,
     required this.state,
     required this.kind,
     this.swatch = CropkeepColors.greenHint,
@@ -2809,6 +2845,11 @@ class _SamplePlot {
   final String iconAsset;
   final int? budget;
   final int spent;
+  // Portion of `spent` that landed on or after local midnight today.
+  // Discretionary status line subtracts this from the per-day target to
+  // show "left today" instead of a pace number that silently shrinks
+  // with every log.
+  final int spentToday;
   final _PlotVisualState state;
   final _PlotKind kind;
   final Color swatch;

@@ -129,6 +129,35 @@ class TransactionRepository {
     });
   }
 
+  // Same shape as `watchPlotSpentByCycle` but restricted to transactions
+  // whose spentAt falls on or after local midnight today. Used by the
+  // daily-pace status line so "left today" can be derived without
+  // re-splitting the full transaction list on the client.
+  //
+  // The "today" cutoff is captured at subscription time. If the app is
+  // left open past midnight the boundary won't advance until the stream
+  // re-subscribes — same limitation as _CycleProvider's cycleDay, so
+  // both refresh together on the next rebuild.
+  Stream<Map<int, int>> watchPlotSpentTodayByCycle(int cycleId) {
+    final now = DateTime.now();
+    final startOfTodayMs =
+        DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
+    final sum = _db.transactions.baseAmount.sum();
+    final query = _db.selectOnly(_db.transactions)
+      ..addColumns([_db.transactions.plotId, sum])
+      ..where(_db.transactions.cycleId.equals(cycleId) &
+          _db.transactions.deletedAt.isNull() &
+          _db.transactions.spentAt
+              .isBiggerOrEqualValue(startOfTodayMs))
+      ..groupBy([_db.transactions.plotId]);
+    return query.watch().map((rows) {
+      return {
+        for (final row in rows)
+          row.read(_db.transactions.plotId)!: row.read(sum) ?? 0,
+      };
+    });
+  }
+
   Stream<List<TransactionRow>> watchRecentlyDeleted({
     Duration window = const Duration(days: 30),
   }) {
